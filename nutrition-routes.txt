@@ -1,0 +1,624 @@
+const router = require('express').Router();
+const nutritionController = require('../controllers/nutritionController');
+const { authenticate } = require('../middleware/auth');
+const { validateRequest, validateQuery } = require('../middleware/validation');
+const { schemas } = require('../middleware/validation');
+const rateLimiter = require('../middleware/rateLimiter');
+const Joi = require('joi');
+
+// Nutrition-specific validation schemas
+const nutritionSchemas = {
+  nutritionPlan: Joi.object({
+    clientId: schemas.uuid.when('$userRole', {
+      is: 'client',
+      then: Joi.optional(),
+      otherwise: Joi.required()
+    }),
+    protein: Joi.object({
+      target: Joi.number().min(0).required(),
+      current: Joi.number().min(0).required()
+    }).optional(),
+    carbs: Joi.object({
+      target: Joi.number().min(0).required(),
+      current: Joi.number().min(0).required()
+    }).optional(),
+    fat: Joi.object({
+      target: Joi.number().min(0).required(),
+      current: Joi.number().min(0).required()
+    }).optional(),
+    calories: Joi.object({
+      target: Joi.number().min(0).required(),
+      current: Joi.number().min(0).required()
+    }).optional(),
+    fiber: Joi.object({
+      target: Joi.number().min(0).required(),
+      current: Joi.number().min(0).required()
+    }).optional(),
+    water: Joi.object({
+      target: Joi.number().min(0).required(),
+      current: Joi.number().min(0).required()
+    }).optional(),
+    mealPlan: Joi.object({
+      breakfast: Joi.string().allow('').optional(),
+      lunch: Joi.string().allow('').optional(),
+      dinner: Joi.string().allow('').optional(),
+      snacks: Joi.string().allow('').optional()
+    }).optional(),
+    restrictions: Joi.array().items(Joi.string()).optional(),
+    supplements: Joi.array().items(Joi.string()).optional()
+  }),
+  
+  dailyLog: Joi.object({
+    date: schemas.date.default(() => new Date()),
+    consumed: Joi.object({
+      protein: Joi.number().min(0).optional(),
+      carbs: Joi.number().min(0).optional(),
+      fat: Joi.number().min(0).optional(),
+      calories: Joi.number().min(0).optional(),
+      fiber: Joi.number().min(0).optional(),
+      water: Joi.number().min(0).optional()
+    }).required(),
+    mealNotes: Joi.string().max(1000).optional()
+  }),
+  
+  nutritionHistory: Joi.object({
+    clientId: schemas.uuid.optional(),
+    startDate: schemas.date.optional(),
+    endDate: schemas.date.optional(),
+    page: Joi.number().integer().min(1).default(1),
+    limit: Joi.number().integer().min(1).max(100).default(30)
+  }),
+  
+  mealSuggestions: Joi.object({
+    clientId: schemas.uuid.optional(),
+    mealType: Joi.string().valid('breakfast', 'lunch', 'dinner', 'snacks', 'all').optional()
+  }),
+  
+  macroCalculation: Joi.object({
+    clientId: schemas.uuid.optional()
+  })
+};
+
+// Apply rate limiting
+router.use(rateLimiter.general);
+
+// Nutrition plan management
+
+// Get nutrition plan
+router.get(
+  '/plan',
+  authenticate,
+  validateQuery(Joi.object({ clientId: schemas.uuid.optional() })),
+  nutritionController.getNutritionPlan
+);
+
+// Update nutrition plan
+router.put(
+  '/plan',
+  authenticate,
+  validateRequest(nutritionSchemas.nutritionPlan),
+  nutritionController.updateNutritionPlan
+);
+
+// Daily nutrition logging
+
+// Log daily nutrition (clients only)
+router.post(
+  '/log',
+  authenticate,
+  validateRequest(nutritionSchemas.dailyLog),
+  nutritionController.logDailyNutrition
+);
+
+// Get nutrition history
+router.get(
+  '/history',
+  authenticate,
+  validateQuery(nutritionSchemas.nutritionHistory),
+  nutritionController.getNutritionHistory
+);
+
+// Meal planning and recommendations
+
+// Generate meal suggestions
+router.get(
+  '/suggestions',
+  authenticate,
+  validateQuery(nutritionSchemas.mealSuggestions),
+  nutritionController.generateMealSuggestions
+);
+
+// Calculate recommended macros
+router.get(
+  '/calculate-macros',
+  authenticate,
+  validateQuery(nutritionSchemas.macroCalculation),
+  nutritionController.calculateRecommendedMacros
+);
+
+// Nutrition templates (for specialists)
+
+// Get nutrition plan templates
+router.get(
+  '/templates',
+  authenticate,
+  validateQuery(Joi.object({
+    category: Joi.string().valid('weight-loss', 'muscle-gain', 'maintenance', 'athletic').optional(),
+    page: Joi.number().integer().min(1).default(1),
+    limit: Joi.number().integer().min(1).max(50).default(20)
+  })),
+  async (req, res) => {
+    try {
+      const { category, page = 1, limit = 20 } = req.query;
+      
+      // Predefined templates
+      const templates = [
+        {
+          id: 'tpl-weight-loss',
+          name: 'Weight Loss Plan',
+          category: 'weight-loss',
+          description: 'High protein, moderate carb plan for sustainable weight loss',
+          macros: {
+            proteinPercentage: 40,
+            carbsPercentage: 30,
+            fatPercentage: 30
+          }
+        },
+        {
+          id: 'tpl-muscle-gain',
+          name: 'Muscle Building Plan',
+          category: 'muscle-gain',
+          description: 'High calorie plan optimized for muscle growth',
+          macros: {
+            proteinPercentage: 30,
+            carbsPercentage: 45,
+            fatPercentage: 25
+          }
+        },
+        {
+          id: 'tpl-maintenance',
+          name: 'Maintenance Plan',
+          category: 'maintenance',
+          description: 'Balanced plan for weight maintenance',
+          macros: {
+            proteinPercentage: 30,
+            carbsPercentage: 40,
+            fatPercentage: 30
+          }
+        },
+        {
+          id: 'tpl-athletic',
+          name: 'Athletic Performance',
+          category: 'athletic',
+          description: 'High carb plan for athletic performance',
+          macros: {
+            proteinPercentage: 25,
+            carbsPercentage: 50,
+            fatPercentage: 25
+          }
+        }
+      ];
+      
+      // Filter by category if specified
+      const filtered = category 
+        ? templates.filter(t => t.category === category)
+        : templates;
+      
+      // Paginate
+      const start = (page - 1) * limit;
+      const paginated = filtered.slice(start, start + limit);
+      
+      res.json({
+        templates: paginated,
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(limit),
+          total: filtered.length,
+          pages: Math.ceil(filtered.length / limit)
+        }
+      });
+    } catch (error) {
+      console.error('Get nutrition templates error:', error);
+      res.status(500).json({ error: 'Failed to fetch templates' });
+    }
+  }
+);
+
+// Apply template to client
+router.post(
+  '/templates/apply',
+  authenticate,
+  validateRequest(Joi.object({
+    templateId: Joi.string().required(),
+    clientId: schemas.uuid.required(),
+    calorieTarget: Joi.number().min(1000).max(10000).required()
+  })),
+  async (req, res) => {
+    try {
+      const { templateId, clientId, calorieTarget } = req.body;
+      const { user } = req;
+      
+      // Verify specialist has access to client
+      const userRoles = JSON.parse(user.roles);
+      if (userRoles.includes('specialist') && !userRoles.includes('admin')) {
+        const clientIds = JSON.parse(user.client_ids || '[]');
+        if (!clientIds.includes(clientId)) {
+          return res.status(403).json({ error: 'Access denied' });
+        }
+      }
+      
+      // Get template
+      const templates = {
+        'tpl-weight-loss': { protein: 0.40, carbs: 0.30, fat: 0.30 },
+        'tpl-muscle-gain': { protein: 0.30, carbs: 0.45, fat: 0.25 },
+        'tpl-maintenance': { protein: 0.30, carbs: 0.40, fat: 0.30 },
+        'tpl-athletic': { protein: 0.25, carbs: 0.50, fat: 0.25 }
+      };
+      
+      const template = templates[templateId];
+      if (!template) {
+        return res.status(404).json({ error: 'Template not found' });
+      }
+      
+      // Calculate macros based on percentages
+      const proteinCalories = calorieTarget * template.protein;
+      const carbsCalories = calorieTarget * template.carbs;
+      const fatCalories = calorieTarget * template.fat;
+      
+      const nutritionData = {
+        clientId,
+        protein: {
+          target: Math.round(proteinCalories / 4), // 4 calories per gram
+          current: 0
+        },
+        carbs: {
+          target: Math.round(carbsCalories / 4),
+          current: 0
+        },
+        fat: {
+          target: Math.round(fatCalories / 9), // 9 calories per gram
+          current: 0
+        },
+        calories: {
+          target: calorieTarget,
+          current: 0
+        },
+        fiber: {
+          target: 30, // Default recommendation
+          current: 0
+        },
+        water: {
+          target: 3000, // Default 3L
+          current: 0
+        }
+      };
+      
+      // Update nutrition plan
+      req.body = nutritionData;
+      return nutritionController.updateNutritionPlan(req, res);
+    } catch (error) {
+      console.error('Apply nutrition template error:', error);
+      res.status(500).json({ error: 'Failed to apply template' });
+    }
+  }
+);
+
+// Nutrition analytics
+
+// Get nutrition compliance stats
+router.get(
+  '/stats/compliance',
+  authenticate,
+  validateQuery(Joi.object({
+    clientId: schemas.uuid.optional(),
+    startDate: schemas.date.optional(),
+    endDate: schemas.date.optional()
+  })),
+  async (req, res) => {
+    try {
+      const { user } = req;
+      const { clientId, startDate, endDate } = req.query;
+      
+      // Determine target client
+      let targetClientId;
+      const userRoles = JSON.parse(user.roles);
+      
+      if (userRoles.includes('client')) {
+        targetClientId = user.id;
+      } else if (clientId) {
+        targetClientId = clientId;
+        
+        // Check access
+        if (userRoles.includes('specialist') && !userRoles.includes('admin')) {
+          const clientIds = JSON.parse(user.client_ids || '[]');
+          if (!clientIds.includes(clientId)) {
+            return res.status(403).json({ error: 'Access denied' });
+          }
+        }
+      } else {
+        return res.status(400).json({ error: 'Client ID required' });
+      }
+      
+      // Get nutrition logs
+      let query = db('nutrition_logs').where({ client_id: targetClientId });
+      
+      if (startDate) query = query.where('date', '>=', startDate);
+      if (endDate) query = query.where('date', '<=', endDate);
+      
+      const logs = await query;
+      
+      // Get nutrition plan for targets
+      const plan = await db('nutrition').where({ client_id: targetClientId }).first();
+      
+      if (!plan || logs.length === 0) {
+        return res.json({
+          compliance: {},
+          averageCompliance: 0,
+          daysLogged: 0,
+          totalDays: 0
+        });
+      }
+      
+      // Calculate compliance
+      const targets = {
+        protein: JSON.parse(plan.protein).target,
+        carbs: JSON.parse(plan.carbs).target,
+        fat: JSON.parse(plan.fat).target,
+        calories: JSON.parse(plan.calories).target,
+        fiber: JSON.parse(plan.fiber).target,
+        water: JSON.parse(plan.water).target
+      };
+      
+      const compliance = {
+        protein: 0,
+        carbs: 0,
+        fat: 0,
+        calories: 0,
+        fiber: 0,
+        water: 0
+      };
+      
+      let totalCompliance = 0;
+      let complianceCount = 0;
+      
+      logs.forEach(log => {
+        ['protein', 'carbs', 'fat', 'calories', 'fiber', 'water'].forEach(macro => {
+          if (targets[macro] > 0 && log[macro] !== null) {
+            const dayCompliance = Math.min(100, (log[macro] / targets[macro]) * 100);
+            compliance[macro] += dayCompliance;
+            totalCompliance += dayCompliance;
+            complianceCount++;
+          }
+        });
+      });
+      
+      // Calculate averages
+      Object.keys(compliance).forEach(macro => {
+        compliance[macro] = logs.length > 0 ? Math.round(compliance[macro] / logs.length) : 0;
+      });
+      
+      const averageCompliance = complianceCount > 0 
+        ? Math.round(totalCompliance / complianceCount)
+        : 0;
+      
+      // Calculate date range
+      const start = startDate ? new Date(startDate) : new Date(logs[0]?.date || new Date());
+      const end = endDate ? new Date(endDate) : new Date();
+      const totalDays = Math.ceil((end - start) / (1000 * 60 * 60 * 24)) + 1;
+      
+      res.json({
+        compliance,
+        averageCompliance,
+        daysLogged: logs.length,
+        totalDays,
+        logRate: Math.round((logs.length / totalDays) * 100)
+      });
+    } catch (error) {
+      console.error('Get compliance stats error:', error);
+      res.status(500).json({ error: 'Failed to fetch compliance statistics' });
+    }
+  }
+);
+
+// Get nutrition trends
+router.get(
+  '/stats/trends',
+  authenticate,
+  validateQuery(Joi.object({
+    clientId: schemas.uuid.optional(),
+    metric: Joi.string().valid('protein', 'carbs', 'fat', 'calories', 'fiber', 'water').required(),
+    period: Joi.string().valid('week', 'month', 'quarter', 'year').default('month')
+  })),
+  async (req, res) => {
+    try {
+      const { user } = req;
+      const { clientId, metric, period } = req.query;
+      
+      // Determine target client
+      let targetClientId;
+      const userRoles = JSON.parse(user.roles);
+      
+      if (userRoles.includes('client')) {
+        targetClientId = user.id;
+      } else if (clientId) {
+        targetClientId = clientId;
+      } else {
+        return res.status(400).json({ error: 'Client ID required' });
+      }
+      
+      // Calculate date range based on period
+      const endDate = new Date();
+      const startDate = new Date();
+      
+      switch (period) {
+        case 'week':
+          startDate.setDate(startDate.getDate() - 7);
+          break;
+        case 'month':
+          startDate.setMonth(startDate.getMonth() - 1);
+          break;
+        case 'quarter':
+          startDate.setMonth(startDate.getMonth() - 3);
+          break;
+        case 'year':
+          startDate.setFullYear(startDate.getFullYear() - 1);
+          break;
+      }
+      
+      // Get logs
+      const logs = await db('nutrition_logs')
+        .where({ client_id: targetClientId })
+        .whereBetween('date', [startDate, endDate])
+        .orderBy('date', 'asc')
+        .select('date', metric);
+      
+      // Get nutrition plan for target
+      const plan = await db('nutrition').where({ client_id: targetClientId }).first();
+      const target = plan ? JSON.parse(plan[metric]).target : null;
+      
+      // Format data for chart
+      const trendData = logs.map(log => ({
+        date: log.date,
+        value: log[metric] || 0,
+        target
+      }));
+      
+      // Calculate statistics
+      const values = logs.map(l => l[metric] || 0).filter(v => v > 0);
+      const stats = values.length > 0 ? {
+        average: Math.round(values.reduce((a, b) => a + b, 0) / values.length),
+        min: Math.min(...values),
+        max: Math.max(...values),
+        current: values[values.length - 1] || 0
+      } : {
+        average: 0,
+        min: 0,
+        max: 0,
+        current: 0
+      };
+      
+      res.json({
+        metric,
+        period,
+        target,
+        trendData,
+        statistics: stats
+      });
+    } catch (error) {
+      console.error('Get nutrition trends error:', error);
+      res.status(500).json({ error: 'Failed to fetch nutrition trends' });
+    }
+  }
+);
+
+// Food database search (placeholder - would integrate with nutrition API)
+router.get(
+  '/foods/search',
+  authenticate,
+  validateQuery(Joi.object({
+    query: Joi.string().min(2).required(),
+    limit: Joi.number().integer().min(1).max(50).default(10)
+  })),
+  async (req, res) => {
+    try {
+      const { query, limit } = req.query;
+      
+      // Mock food database - in production, this would query a nutrition API
+      const mockFoods = [
+        { id: 1, name: 'Chicken Breast', calories: 165, protein: 31, carbs: 0, fat: 3.6, serving: '100g' },
+        { id: 2, name: 'Brown Rice', calories: 216, protein: 5, carbs: 45, fat: 1.8, serving: '1 cup' },
+        { id: 3, name: 'Broccoli', calories: 55, protein: 3.7, carbs: 11, fat: 0.6, serving: '1 cup' },
+        { id: 4, name: 'Salmon', calories: 208, protein: 20, carbs: 0, fat: 13, serving: '100g' },
+        { id: 5, name: 'Sweet Potato', calories: 180, protein: 4, carbs: 41, fat: 0.3, serving: '1 medium' }
+      ];
+      
+      // Simple search
+      const results = mockFoods
+        .filter(food => food.name.toLowerCase().includes(query.toLowerCase()))
+        .slice(0, limit);
+      
+      res.json({ foods: results });
+    } catch (error) {
+      console.error('Food search error:', error);
+      res.status(500).json({ error: 'Failed to search foods' });
+    }
+  }
+);
+
+// Export nutrition data
+router.get(
+  '/export',
+  authenticate,
+  validateQuery(Joi.object({
+    clientId: schemas.uuid.optional(),
+    startDate: schemas.date.optional(),
+    endDate: schemas.date.optional(),
+    format: Joi.string().valid('json', 'csv').default('json')
+  })),
+  rateLimiter.strict,
+  async (req, res) => {
+    try {
+      const { user } = req;
+      const { clientId, startDate, endDate, format } = req.query;
+      
+      // Determine target client
+      let targetClientId;
+      const userRoles = JSON.parse(user.roles);
+      
+      if (userRoles.includes('client')) {
+        targetClientId = user.id;
+      } else if (clientId) {
+        targetClientId = clientId;
+      } else {
+        return res.status(400).json({ error: 'Client ID required' });
+      }
+      
+      // Get data
+      let logsQuery = db('nutrition_logs').where({ client_id: targetClientId });
+      if (startDate) logsQuery = logsQuery.where('date', '>=', startDate);
+      if (endDate) logsQuery = logsQuery.where('date', '<=', endDate);
+      
+      const [nutritionPlan, logs] = await Promise.all([
+        db('nutrition').where({ client_id: targetClientId }).first(),
+        logsQuery.orderBy('date', 'asc')
+      ]);
+      
+      if (format === 'csv') {
+        // Generate CSV
+        const csv = [
+          'Date,Protein,Carbs,Fat,Calories,Fiber,Water,Notes',
+          ...logs.map(log => 
+            `${log.date},${log.protein || 0},${log.carbs || 0},${log.fat || 0},${log.calories || 0},${log.fiber || 0},${log.water || 0},"${log.meal_notes || ''}"`
+          )
+        ].join('\n');
+        
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', 'attachment; filename="nutrition-export.csv"');
+        res.send(csv);
+      } else {
+        // JSON format
+        res.json({
+          nutritionPlan: nutritionPlan ? {
+            protein: JSON.parse(nutritionPlan.protein),
+            carbs: JSON.parse(nutritionPlan.carbs),
+            fat: JSON.parse(nutritionPlan.fat),
+            calories: JSON.parse(nutritionPlan.calories),
+            fiber: JSON.parse(nutritionPlan.fiber),
+            water: JSON.parse(nutritionPlan.water),
+            mealPlan: JSON.parse(nutritionPlan.meal_plan),
+            restrictions: JSON.parse(nutritionPlan.restrictions || '[]'),
+            supplements: JSON.parse(nutritionPlan.supplements || '[]')
+          } : null,
+          logs,
+          exportDate: new Date(),
+          period: { startDate, endDate }
+        });
+      }
+    } catch (error) {
+      console.error('Export nutrition data error:', error);
+      res.status(500).json({ error: 'Failed to export nutrition data' });
+    }
+  }
+);
+
+module.exports = router;

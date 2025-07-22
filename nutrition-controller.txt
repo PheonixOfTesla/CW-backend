@@ -1,0 +1,830 @@
+const { db } = require('../config/database');
+
+// Get nutrition plan
+const getNutritionPlan = async (req, res) => {
+  try {
+    const { user } = req;
+    const { clientId } = req.query;
+    
+    // Determine which nutrition plan to fetch
+    let targetClientId;
+    const userRoles = JSON.parse(user.roles);
+    
+    if (userRoles.includes('client')) {
+      // Clients can only see their own nutrition plan
+      targetClientId = user.id;
+    } else if (clientId) {
+      // Specialists/admins can view specific client's plan
+      targetClientId = clientId;
+      
+      // Check if specialist has access to this client
+      if (userRoles.includes('specialist') && !userRoles.includes('admin')) {
+        const clientIds = JSON.parse(user.client_ids || '[]');
+        if (!clientIds.includes(clientId)) {
+          return res.status(403).json({ error: 'Access denied' });
+        }
+      }
+    } else {
+      return res.status(400).json({ error: 'Client ID required' });
+    }
+    
+    // Get nutrition plan
+    const nutritionPlan = await db('nutrition')
+      .select('*')
+      .where({ client_id: targetClientId })
+      .first();
+    
+    if (!nutritionPlan) {
+      // Create default nutrition plan if it doesn't exist
+      const [newPlan] = await db('nutrition')
+        .insert({
+          client_id: targetClientId,
+          assigned_by: user.id,
+          protein: JSON.stringify({ target: 0, current: 0 }),
+          carbs: JSON.stringify({ target: 0, current: 0 }),
+          fat: JSON.stringify({ target: 0, current: 0 }),
+          calories: JSON.stringify({ target: 0, current: 0 }),
+          fiber: JSON.stringify({ target: 0, current: 0 }),
+          water: JSON.stringify({ target: 0, current: 0 }),
+          meal_plan: JSON.stringify({
+            breakfast: '',
+            lunch: '',
+            dinner: '',
+            snacks: ''
+          }),
+          restrictions: JSON.stringify([]),
+          supplements: JSON.stringify([])
+        })
+        .returning('*');
+      
+      return res.json(formatNutritionPlan(newPlan));
+    }
+    
+    // Get client info for context
+    const client = await db('users')
+      .select('id', 'name', 'email')
+      .where({ id: targetClientId })
+      .first();
+    
+    // Get assigned by info
+    const assignedBy = await db('users')
+      .select('id', 'name')
+      .where({ id: nutritionPlan.assigned_by })
+      .first();
+    
+    res.json({
+      ...formatNutritionPlan(nutritionPlan),
+      client,
+      assignedBy
+    });
+  } catch (error) {
+    console.error('Get nutrition plan error:', error);
+    res.status(500).json({ error: 'Failed to fetch nutrition plan' });
+  }
+};
+
+// Update nutrition plan
+const updateNutritionPlan = async (req, res) => {
+  const trx = await db.transaction();
+  
+  try {
+    const { user } = req;
+    const updateData = req.body;
+    
+    // Determine client ID
+    let targetClientId;
+    const userRoles = JSON.parse(user.roles);
+    
+    if (userRoles.includes('client')) {
+      targetClientId = user.id;
+    } else {
+      targetClientId = updateData.clientId;
+      if (!targetClientId) {
+        await trx.rollback();
+        return res.status(400).json({ error: 'Client ID required' });
+      }
+      
+      // Check if specialist has access to this client
+      if (userRoles.includes('specialist') && !userRoles.includes('admin')) {
+        const clientIds = JSON.parse(user.client_ids || '[]');
+        if (!clientIds.includes(targetClientId)) {
+          await trx.rollback();
+          return res.status(403).json({ error: 'Access denied' });
+        }
+      }
+    }
+    
+    // Check if nutrition plan exists
+    const existing = await trx('nutrition')
+      .where({ client_id: targetClientId })
+      .first();
+    
+    // Prepare update data
+    const nutritionData = {};
+    
+    // Update macros if provided
+    if (updateData.protein) nutritionData.protein = JSON.stringify(updateData.protein);
+    if (updateData.carbs) nutritionData.carbs = JSON.stringify(updateData.carbs);
+    if (updateData.fat) nutritionData.fat = JSON.stringify(updateData.fat);
+    if (updateData.calories) nutritionData.calories = JSON.stringify(updateData.calories);
+    if (updateData.fiber) nutritionData.fiber = JSON.stringify(updateData.fiber);
+    if (updateData.water) nutritionData.water = JSON.stringify(updateData.water);
+    
+    // Update meal plan if provided
+    if (updateData.mealPlan) {
+      nutritionData.meal_plan = JSON.stringify(updateData.mealPlan);
+    }
+    
+    // Update restrictions and supplements
+    if (updateData.restrictions !== undefined) {
+      nutritionData.restrictions = JSON.stringify(updateData.restrictions);
+    }
+    if (updateData.supplements !== undefined) {
+      nutritionData.supplements = JSON.stringify(updateData.supplements);
+    }
+    
+    nutritionData.updated_at = new Date();
+    
+    let nutritionPlan;
+    
+    if (existing) {
+      // Update existing plan
+      nutritionData.assigned_by = user.id; // Update who last modified
+      
+      [nutritionPlan] = await trx('nutrition')
+        .where({ client_id: targetClientId })
+        .update(nutritionData)
+        .returning('*');
+    } else {
+      // Create new plan
+      nutritionData.client_id = targetClientId;
+      nutritionData.assigned_by = user.id;
+      
+      // Set defaults for missing fields
+      if (!nutritionData.protein) nutritionData.protein = JSON.stringify({ target: 0, current: 0 });
+      if (!nutritionData.carbs) nutritionData.carbs = JSON.stringify({ target: 0, current: 0 });
+      if (!nutritionData.fat) nutritionData.fat = JSON.stringify({ target: 0, current: 0 });
+      if (!nutritionData.calories) nutritionData.calories = JSON.stringify({ target: 0, current: 0 });
+      if (!nutritionData.fiber) nutritionData.fiber = JSON.stringify({ target: 0, current: 0 });
+      if (!nutritionData.water) nutritionData.water = JSON.stringify({ target: 0, current: 0 });
+      if (!nutritionData.meal_plan) nutritionData.meal_plan = JSON.stringify({
+        breakfast: '',
+        lunch: '',
+        dinner: '',
+        snacks: ''
+      });
+      if (!nutritionData.restrictions) nutritionData.restrictions = JSON.stringify([]);
+      if (!nutritionData.supplements) nutritionData.supplements = JSON.stringify([]);
+      
+      [nutritionPlan] = await trx('nutrition')
+        .insert(nutritionData)
+        .returning('*');
+    }
+    
+    // Calculate if macros are balanced
+    const formattedPlan = formatNutritionPlan(nutritionPlan);
+    const macroAnalysis = analyzeMacros(formattedPlan);
+    
+    // Send notification if specialist updated client's plan
+    if (userRoles.includes('specialist') && targetClientId !== user.id) {
+      const io = req.app.get('io');
+      io.to(targetClientId).emit('nutrition-updated', {
+        updatedBy: user.name,
+        message: 'Your nutrition plan has been updated',
+        macroAnalysis
+      });
+    }
+    
+    // Log audit
+    await trx('audit_logs').insert({
+      user_id: user.id,
+      action: existing ? 'update' : 'create',
+      resource: 'nutrition',
+      resource_id: targetClientId,
+      details: `${existing ? 'Updated' : 'Created'} nutrition plan`,
+      ip_address: req.ip,
+      user_agent: req.get('user-agent'),
+      metadata: JSON.stringify({ macroAnalysis })
+    });
+    
+    await trx.commit();
+    
+    res.json({
+      ...formattedPlan,
+      macroAnalysis,
+      message: 'Nutrition plan updated successfully'
+    });
+  } catch (error) {
+    await trx.rollback();
+    console.error('Update nutrition plan error:', error);
+    res.status(500).json({ error: 'Failed to update nutrition plan' });
+  }
+};
+
+// Log daily nutrition
+const logDailyNutrition = async (req, res) => {
+  const trx = await db.transaction();
+  
+  try {
+    const { user } = req;
+    const { date, consumed } = req.body;
+    
+    // Only clients can log their own nutrition
+    const userRoles = JSON.parse(user.roles);
+    if (!userRoles.includes('client')) {
+      await trx.rollback();
+      return res.status(403).json({ error: 'Only clients can log nutrition' });
+    }
+    
+    // Get current nutrition plan
+    const nutritionPlan = await trx('nutrition')
+      .where({ client_id: user.id })
+      .first();
+    
+    if (!nutritionPlan) {
+      await trx.rollback();
+      return res.status(404).json({ error: 'Nutrition plan not found' });
+    }
+    
+    // Update current values
+    const updates = {};
+    
+    if (consumed.protein !== undefined) {
+      const protein = JSON.parse(nutritionPlan.protein);
+      protein.current = consumed.protein;
+      updates.protein = JSON.stringify(protein);
+    }
+    
+    if (consumed.carbs !== undefined) {
+      const carbs = JSON.parse(nutritionPlan.carbs);
+      carbs.current = consumed.carbs;
+      updates.carbs = JSON.stringify(carbs);
+    }
+    
+    if (consumed.fat !== undefined) {
+      const fat = JSON.parse(nutritionPlan.fat);
+      fat.current = consumed.fat;
+      updates.fat = JSON.stringify(fat);
+    }
+    
+    if (consumed.calories !== undefined) {
+      const calories = JSON.parse(nutritionPlan.calories);
+      calories.current = consumed.calories;
+      updates.calories = JSON.stringify(calories);
+    }
+    
+    if (consumed.fiber !== undefined) {
+      const fiber = JSON.parse(nutritionPlan.fiber);
+      fiber.current = consumed.fiber;
+      updates.fiber = JSON.stringify(fiber);
+    }
+    
+    if (consumed.water !== undefined) {
+      const water = JSON.parse(nutritionPlan.water);
+      water.current = consumed.water;
+      updates.water = JSON.stringify(water);
+    }
+    
+    updates.updated_at = new Date();
+    
+    // Update nutrition plan
+    const [updated] = await trx('nutrition')
+      .where({ client_id: user.id })
+      .update(updates)
+      .returning('*');
+    
+    // Create daily log entry (for history tracking)
+    await trx('nutrition_logs').insert({
+      client_id: user.id,
+      date: date || new Date(),
+      protein: consumed.protein,
+      carbs: consumed.carbs,
+      fat: consumed.fat,
+      calories: consumed.calories,
+      fiber: consumed.fiber,
+      water: consumed.water,
+      meal_notes: consumed.mealNotes
+    });
+    
+    // Calculate compliance
+    const formattedPlan = formatNutritionPlan(updated);
+    const compliance = calculateCompliance(formattedPlan);
+    
+    await trx.commit();
+    
+    res.json({
+      ...formattedPlan,
+      compliance,
+      message: 'Daily nutrition logged successfully'
+    });
+  } catch (error) {
+    await trx.rollback();
+    console.error('Log daily nutrition error:', error);
+    res.status(500).json({ error: 'Failed to log nutrition' });
+  }
+};
+
+// Get nutrition history
+const getNutritionHistory = async (req, res) => {
+  try {
+    const { user } = req;
+    const { clientId, startDate, endDate, page = 1, limit = 30 } = req.query;
+    
+    // Determine which client's history to fetch
+    let targetClientId;
+    const userRoles = JSON.parse(user.roles);
+    
+    if (userRoles.includes('client')) {
+      targetClientId = user.id;
+    } else if (clientId) {
+      targetClientId = clientId;
+      
+      // Check access
+      if (userRoles.includes('specialist') && !userRoles.includes('admin')) {
+        const clientIds = JSON.parse(user.client_ids || '[]');
+        if (!clientIds.includes(clientId)) {
+          return res.status(403).json({ error: 'Access denied' });
+        }
+      }
+    } else {
+      return res.status(400).json({ error: 'Client ID required' });
+    }
+    
+    // Build query
+    let query = db('nutrition_logs')
+      .where({ client_id: targetClientId });
+    
+    if (startDate) {
+      query = query.where('date', '>=', startDate);
+    }
+    
+    if (endDate) {
+      query = query.where('date', '<=', endDate);
+    }
+    
+    // Get total count
+    const [{ count }] = await query.clone().count('* as count');
+    
+    // Get paginated results
+    const offset = (page - 1) * limit;
+    const logs = await query
+      .orderBy('date', 'desc')
+      .limit(limit)
+      .offset(offset);
+    
+    // Calculate averages
+    const averages = await query.clone()
+      .select(
+        db.raw('AVG(protein) as avg_protein'),
+        db.raw('AVG(carbs) as avg_carbs'),
+        db.raw('AVG(fat) as avg_fat'),
+        db.raw('AVG(calories) as avg_calories'),
+        db.raw('AVG(fiber) as avg_fiber'),
+        db.raw('AVG(water) as avg_water')
+      )
+      .first();
+    
+    res.json({
+      logs,
+      averages: {
+        protein: Math.round(averages.avg_protein) || 0,
+        carbs: Math.round(averages.avg_carbs) || 0,
+        fat: Math.round(averages.avg_fat) || 0,
+        calories: Math.round(averages.avg_calories) || 0,
+        fiber: Math.round(averages.avg_fiber) || 0,
+        water: Math.round(averages.avg_water) || 0
+      },
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: parseInt(count),
+        pages: Math.ceil(count / limit)
+      }
+    });
+  } catch (error) {
+    console.error('Get nutrition history error:', error);
+    res.status(500).json({ error: 'Failed to fetch nutrition history' });
+  }
+};
+
+// Generate meal suggestions
+const generateMealSuggestions = async (req, res) => {
+  try {
+    const { user } = req;
+    const { clientId, mealType } = req.query;
+    
+    // Determine target client
+    let targetClientId;
+    const userRoles = JSON.parse(user.roles);
+    
+    if (userRoles.includes('client')) {
+      targetClientId = user.id;
+    } else if (clientId) {
+      targetClientId = clientId;
+    } else {
+      return res.status(400).json({ error: 'Client ID required' });
+    }
+    
+    // Get nutrition plan and restrictions
+    const nutritionPlan = await db('nutrition')
+      .where({ client_id: targetClientId })
+      .first();
+    
+    if (!nutritionPlan) {
+      return res.status(404).json({ error: 'Nutrition plan not found' });
+    }
+    
+    const restrictions = JSON.parse(nutritionPlan.restrictions || '[]');
+    const targetMacros = {
+      protein: JSON.parse(nutritionPlan.protein).target,
+      carbs: JSON.parse(nutritionPlan.carbs).target,
+      fat: JSON.parse(nutritionPlan.fat).target,
+      calories: JSON.parse(nutritionPlan.calories).target
+    };
+    
+    // Generate meal suggestions based on targets and restrictions
+    const suggestions = generateMealOptions(targetMacros, restrictions, mealType);
+    
+    res.json({
+      mealType: mealType || 'all',
+      targetMacros,
+      restrictions,
+      suggestions
+    });
+  } catch (error) {
+    console.error('Generate meal suggestions error:', error);
+    res.status(500).json({ error: 'Failed to generate meal suggestions' });
+  }
+};
+
+// Calculate BMR and recommended macros
+const calculateRecommendedMacros = async (req, res) => {
+  try {
+    const { user } = req;
+    const { clientId } = req.query;
+    
+    // Determine target client
+    let targetClientId;
+    const userRoles = JSON.parse(user.roles);
+    
+    if (userRoles.includes('client')) {
+      targetClientId = user.id;
+    } else if (clientId) {
+      targetClientId = clientId;
+      
+      // Check access
+      if (userRoles.includes('specialist') && !userRoles.includes('admin')) {
+        const clientIds = JSON.parse(user.client_ids || '[]');
+        if (!clientIds.includes(clientId)) {
+          return res.status(403).json({ error: 'Access denied' });
+        }
+      }
+    } else {
+      return res.status(400).json({ error: 'Client ID required' });
+    }
+    
+    // Get latest measurement for calculations
+    const latestMeasurement = await db('measurements')
+      .where({ client_id: targetClientId })
+      .orderBy('date', 'desc')
+      .first();
+    
+    if (!latestMeasurement) {
+      return res.status(400).json({ 
+        error: 'No measurements found. Please add body measurements first.' 
+      });
+    }
+    
+    // Get user info for age and gender
+    const client = await db('users')
+      .select('id', 'name', 'specialization')
+      .where({ id: targetClientId })
+      .first();
+    
+    const specialization = client.specialization ? JSON.parse(client.specialization) : {};
+    const age = latestMeasurement.age || specialization.age || 30;
+    const gender = latestMeasurement.gender || specialization.gender || 'male';
+    const activityLevel = latestMeasurement.activity_level || specialization.activityLevel || 'moderate';
+    
+    // Calculate BMR using Mifflin-St Jeor equation
+    let bmr;
+    if (gender === 'male') {
+      bmr = (10 * latestMeasurement.weight) + (6.25 * (latestMeasurement.height || 175)) - (5 * age) + 5;
+    } else {
+      bmr = (10 * latestMeasurement.weight) + (6.25 * (latestMeasurement.height || 165)) - (5 * age) - 161;
+    }
+    
+    // Calculate TDEE based on activity level
+    const activityMultipliers = {
+      sedentary: 1.2,
+      light: 1.375,
+      moderate: 1.55,
+      active: 1.725,
+      veryActive: 1.9
+    };
+    
+    const tdee = Math.round(bmr * (activityMultipliers[activityLevel] || 1.55));
+    
+    // Calculate recommended macros (moderate approach)
+    const recommendations = {
+      maintenance: {
+        calories: tdee,
+        protein: Math.round(latestMeasurement.weight * 2.2), // 1g per lb
+        fat: Math.round(tdee * 0.25 / 9), // 25% of calories from fat
+        carbs: Math.round((tdee - (latestMeasurement.weight * 2.2 * 4) - (tdee * 0.25)) / 4),
+        fiber: gender === 'male' ? 38 : 25,
+        water: Math.round(latestMeasurement.weight * 35) // ml per kg
+      },
+      cutting: {
+        calories: Math.round(tdee * 0.8), // 20% deficit
+        protein: Math.round(latestMeasurement.weight * 2.4), // Higher protein when cutting
+        fat: Math.round(tdee * 0.8 * 0.25 / 9),
+        carbs: Math.round((tdee * 0.8 - (latestMeasurement.weight * 2.4 * 4) - (tdee * 0.8 * 0.25)) / 4),
+        fiber: gender === 'male' ? 38 : 25,
+        water: Math.round(latestMeasurement.weight * 40) // More water when cutting
+      },
+      bulking: {
+        calories: Math.round(tdee * 1.15), // 15% surplus
+        protein: Math.round(latestMeasurement.weight * 2.0),
+        fat: Math.round(tdee * 1.15 * 0.25 / 9),
+        carbs: Math.round((tdee * 1.15 - (latestMeasurement.weight * 2.0 * 4) - (tdee * 1.15 * 0.25)) / 4),
+        fiber: gender === 'male' ? 38 : 25,
+        water: Math.round(latestMeasurement.weight * 35)
+      }
+    };
+    
+    res.json({
+      client: {
+        id: client.id,
+        name: client.name,
+        weight: latestMeasurement.weight,
+        height: latestMeasurement.height || (gender === 'male' ? 175 : 165),
+        age,
+        gender,
+        activityLevel
+      },
+      calculations: {
+        bmr: Math.round(bmr),
+        tdee,
+        activityMultiplier: activityMultipliers[activityLevel] || 1.55
+      },
+      recommendations
+    });
+  } catch (error) {
+    console.error('Calculate recommended macros error:', error);
+    res.status(500).json({ error: 'Failed to calculate recommendations' });
+  }
+};
+
+// Helper functions
+
+const formatNutritionPlan = (plan) => {
+  return {
+    clientId: plan.client_id,
+    assignedBy: plan.assigned_by,
+    protein: JSON.parse(plan.protein),
+    carbs: JSON.parse(plan.carbs),
+    fat: JSON.parse(plan.fat),
+    calories: JSON.parse(plan.calories),
+    fiber: JSON.parse(plan.fiber),
+    water: JSON.parse(plan.water),
+    mealPlan: JSON.parse(plan.meal_plan),
+    restrictions: JSON.parse(plan.restrictions || '[]'),
+    supplements: JSON.parse(plan.supplements || '[]'),
+    createdAt: plan.created_at,
+    updatedAt: plan.updated_at
+  };
+};
+
+const analyzeMacros = (nutritionPlan) => {
+  const { protein, carbs, fat, calories } = nutritionPlan;
+  
+  // Calculate calories from macros
+  const proteinCalories = protein.target * 4;
+  const carbCalories = carbs.target * 4;
+  const fatCalories = fat.target * 9;
+  const totalMacroCalories = proteinCalories + carbCalories + fatCalories;
+  
+  // Calculate percentages
+  const proteinPercentage = Math.round((proteinCalories / totalMacroCalories) * 100);
+  const carbPercentage = Math.round((carbCalories / totalMacroCalories) * 100);
+  const fatPercentage = Math.round((fatCalories / totalMacroCalories) * 100);
+  
+  // Check if macros match calorie target
+  const calorieDiscrepancy = Math.abs(totalMacroCalories - calories.target);
+  const isBalanced = calorieDiscrepancy < 50; // Within 50 calories
+  
+  return {
+    totalMacroCalories,
+    calorieDiscrepancy,
+    isBalanced,
+    distribution: {
+      protein: proteinPercentage,
+      carbs: carbPercentage,
+      fat: fatPercentage
+    },
+    recommendations: generateMacroRecommendations(proteinPercentage, carbPercentage, fatPercentage)
+  };
+};
+
+const generateMacroRecommendations = (proteinPct, carbPct, fatPct) => {
+  const recommendations = [];
+  
+  if (proteinPct < 20) {
+    recommendations.push('Consider increasing protein for muscle preservation');
+  } else if (proteinPct > 40) {
+    recommendations.push('Protein is quite high - ensure adequate carbs for energy');
+  }
+  
+  if (carbPct < 30) {
+    recommendations.push('Low carb approach - monitor energy levels');
+  } else if (carbPct > 60) {
+    recommendations.push('High carb approach - good for active individuals');
+  }
+  
+  if (fatPct < 20) {
+    recommendations.push('Fat intake is low - important for hormone production');
+  } else if (fatPct > 40) {
+    recommendations.push('High fat approach - ensure carbs are sufficient for workouts');
+  }
+  
+  if (recommendations.length === 0) {
+    recommendations.push('Macro distribution looks well-balanced!');
+  }
+  
+  return recommendations;
+};
+
+const calculateCompliance = (nutritionPlan) => {
+  const macros = ['protein', 'carbs', 'fat', 'calories', 'fiber', 'water'];
+  let totalCompliance = 0;
+  let validMacros = 0;
+  
+  const compliance = {};
+  
+  macros.forEach(macro => {
+    const data = nutritionPlan[macro];
+    if (data.target > 0) {
+      const percentage = Math.min(100, Math.round((data.current / data.target) * 100));
+      compliance[macro] = percentage;
+      totalCompliance += percentage;
+      validMacros++;
+    }
+  });
+  
+  compliance.overall = validMacros > 0 ? Math.round(totalCompliance / validMacros) : 0;
+  
+  return compliance;
+};
+
+const generateMealOptions = (targetMacros, restrictions, mealType) => {
+  // This is a simplified meal suggestion generator
+  // In production, this would connect to a nutrition API or database
+  
+  const meals = {
+    breakfast: [
+      {
+        name: 'Protein Oatmeal Bowl',
+        calories: 400,
+        protein: 30,
+        carbs: 45,
+        fat: 10,
+        ingredients: ['Oats', 'Protein powder', 'Berries', 'Almond butter'],
+        restrictions: ['gluten-free option available']
+      },
+      {
+        name: 'Egg White Scramble',
+        calories: 350,
+        protein: 35,
+        carbs: 30,
+        fat: 8,
+        ingredients: ['Egg whites', 'Vegetables', 'Whole grain toast'],
+        restrictions: []
+      }
+    ],
+    lunch: [
+      {
+        name: 'Grilled Chicken Salad',
+        calories: 450,
+        protein: 40,
+        carbs: 35,
+        fat: 15,
+        ingredients: ['Chicken breast', 'Mixed greens', 'Quinoa', 'Olive oil'],
+        restrictions: ['gluten-free']
+      },
+      {
+        name: 'Turkey and Avocado Wrap',
+        calories: 500,
+        protein: 35,
+        carbs: 45,
+        fat: 18,
+        ingredients: ['Turkey', 'Avocado', 'Whole wheat tortilla', 'Vegetables'],
+        restrictions: []
+      }
+    ],
+    dinner: [
+      {
+        name: 'Salmon with Sweet Potato',
+        calories: 550,
+        protein: 40,
+        carbs: 50,
+        fat: 20,
+        ingredients: ['Salmon', 'Sweet potato', 'Broccoli', 'Olive oil'],
+        restrictions: ['gluten-free', 'dairy-free']
+      },
+      {
+        name: 'Lean Beef Stir-fry',
+        calories: 500,
+        protein: 45,
+        carbs: 40,
+        fat: 15,
+        ingredients: ['Lean beef', 'Brown rice', 'Mixed vegetables', 'Soy sauce'],
+        restrictions: ['gluten-free option available']
+      }
+    ],
+    snacks: [
+      {
+        name: 'Greek Yogurt Parfait',
+        calories: 200,
+        protein: 20,
+        carbs: 25,
+        fat: 3,
+        ingredients: ['Greek yogurt', 'Berries', 'Granola'],
+        restrictions: []
+      },
+      {
+        name: 'Protein Shake',
+        calories: 250,
+        protein: 30,
+        carbs: 20,
+        fat: 5,
+        ingredients: ['Protein powder', 'Banana', 'Almond milk'],
+        restrictions: ['dairy-free option available']
+      }
+    ]
+  };
+  
+  // Filter based on restrictions
+  const filterMeals = (mealList) => {
+    return mealList.filter(meal => {
+      // Check if meal violates any restrictions
+      for (const restriction of restrictions) {
+        if (restriction.toLowerCase().includes('vegetarian') && 
+            (meal.ingredients.some(i => i.toLowerCase().includes('chicken') || 
+             i.toLowerCase().includes('beef') || 
+             i.toLowerCase().includes('turkey') || 
+             i.toLowerCase().includes('salmon')))) {
+          return false;
+        }
+        if (restriction.toLowerCase().includes('vegan') && 
+            (meal.ingredients.some(i => i.toLowerCase().includes('egg') || 
+             i.toLowerCase().includes('yogurt') || 
+             i.toLowerCase().includes('protein powder')))) {
+          return false;
+        }
+        // Add more restriction checks as needed
+      }
+      return true;
+    });
+  };
+  
+  if (mealType && meals[mealType]) {
+    return filterMeals(meals[mealType]);
+  }
+  
+  // Return all meals
+  const allMeals = {};
+  Object.keys(meals).forEach(type => {
+    allMeals[type] = filterMeals(meals[type]);
+  });
+  
+  return allMeals;
+};
+
+// Create nutrition logs table if it doesn't exist
+const createNutritionLogsTable = `
+  CREATE TABLE IF NOT EXISTS nutrition_logs (
+    id SERIAL PRIMARY KEY,
+    client_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    date DATE NOT NULL,
+    protein INTEGER,
+    carbs INTEGER,
+    fat INTEGER,
+    calories INTEGER,
+    fiber INTEGER,
+    water INTEGER,
+    meal_notes TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_nutrition_logs_client_date (client_id, date)
+  );
+`;
+
+module.exports = {
+  getNutritionPlan,
+  updateNutritionPlan,
+  logDailyNutrition,
+  getNutritionHistory,
+  generateMealSuggestions,
+  calculateRecommendedMacros
+};

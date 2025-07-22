@@ -1,0 +1,1008 @@
+const stripe = require('../config/stripe');
+const { db } = require('../config/database');
+const emailService = require('../services/emailService');
+
+// Create checkout session
+const createCheckoutSession = async (req, res) => {
+  try {
+    const { user } = req;
+    const { 
+      priceId, 
+      successUrl, 
+      cancelUrl,
+      mode = 'subscription', // subscription or payment
+      quantity = 1,
+      metadata = {}
+    } = req.body;
+    
+    // Validate inputs
+    if (!priceId || !successUrl || !cancelUrl) {
+      return res.status(400).json({ 
+        error: 'Price ID, success URL, and cancel URL are required' 
+      });
+    }
+    
+    // Get or create Stripe customer
+    let stripeCustomerId = user.stripe_customer_id;
+    
+    if (!stripeCustomerId) {
+      const customer = await stripe.customers.create({
+        email: user.email,
+        name: user.name,
+        phone: user.phone,
+        metadata: {
+          userId: user.id,
+          platform: 'clockwork'
+        }
+      });
+      
+      // Save Stripe customer ID
+      await db('users')
+        .where({ id: user.id })
+        .update({ stripe_customer_id: customer.id });
+      
+      stripeCustomerId = customer.id;
+    }
+    
+    // Create checkout session
+    const sessionConfig = {
+      customer: stripeCustomerId,
+      payment_method_types: ['card'],
+      line_items: [{
+        price: priceId,
+        quantity
+      }],
+      mode,
+      success_url: successUrl,
+      cancel_url: cancelUrl,
+      metadata: {
+        userId: user.id,
+        ...metadata
+      }
+    };
+    
+    // Add subscription-specific options
+    if (mode === 'subscription') {
+      sessionConfig.subscription_data = {
+        trial_period_days: metadata.trialDays || 0,
+        metadata: {
+          userId: user.id,
+          platform: 'clockwork'
+        }
+      };
+    }
+    
+    // Add invoice-specific options
+    if (metadata.invoiceId) {
+      sessionConfig.invoice_creation = {
+        enabled: true
+      };
+    }
+    
+    const session = await stripe.checkout.sessions.create(sessionConfig);
+    
+    // Log audit
+    await db('audit_logs').insert({
+      user_id: user.id,
+      action: 'create_checkout_session',
+      resource: 'billing',
+      resource_id: session.id,
+      details: `Created checkout session for ${mode}`,
+      ip_address: req.ip,
+      user_agent: req.get('user-agent'),
+      metadata: JSON.stringify({ 
+        priceId,
+        mode,
+        sessionId: session.id
+      })
+    });
+    
+    res.json({
+      sessionId: session.id,
+      url: session.url
+    });
+  } catch (error) {
+    console.error('Create checkout session error:', error);
+    res.status(500).json({ error: 'Failed to create checkout session' });
+  }
+};
+
+// Handle Stripe webhook
+const handleWebhook = async (req, res) => {
+  let event;
+  
+  try {
+    // Verify webhook signature
+    const sig = req.headers['stripe-signature'];
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (err) {
+    console.error('Webhook signature verification failed:', err);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+  
+  // Handle the event
+  try {
+    switch (event.type) {
+      case 'checkout.session.completed':
+        await handleCheckoutComplete(event.data.object);
+        break;
+        
+      case 'invoice.created':
+        await handleInvoiceCreated(event.data.object);
+        break;
+        
+      case 'invoice.payment_succeeded':
+        await handleInvoicePaymentSucceeded(event.data.object);
+        break;
+        
+      case 'invoice.payment_failed':
+        await handleInvoicePaymentFailed(event.data.object);
+        break;
+        
+      case 'customer.subscription.created':
+        await handleSubscriptionCreated(event.data.object);
+        break;
+        
+      case 'customer.subscription.updated':
+        await handleSubscriptionUpdated(event.data.object);
+        break;
+        
+      case 'customer.subscription.deleted':
+        await handleSubscriptionDeleted(event.data.object);
+        break;
+        
+      case 'payment_intent.succeeded':
+        await handlePaymentIntentSucceeded(event.data.object);
+        break;
+        
+      case 'payment_intent.payment_failed':
+        await handlePaymentIntentFailed(event.data.object);
+        break;
+        
+      default:
+        console.log(`Unhandled event type ${event.type}`);
+    }
+    
+    res.json({ received: true });
+  } catch (error) {
+    console.error('Webhook handler error:', error);
+    res.status(500).json({ error: 'Webhook handler failed' });
+  }
+};
+
+// Webhook handlers
+const handleCheckoutComplete = async (session) => {
+  try {
+    const userId = session.metadata.userId;
+    
+    if (session.mode === 'subscription') {
+      // Subscription created via checkout
+      const subscription = await stripe.subscriptions.retrieve(session.subscription);
+      await createOrUpdateSubscription(subscription, userId);
+    } else {
+      // One-time payment
+      const paymentIntent = await stripe.paymentIntents.retrieve(session.payment_intent);
+      await recordPayment(paymentIntent, userId);
+    }
+    
+    // Update user's billing status if needed
+    await db('users')
+      .where({ id: userId })
+      .update({ 
+        billing_enabled: true,
+        updated_at: new Date()
+      });
+  } catch (error) {
+    console.error('Handle checkout complete error:', error);
+  }
+};
+
+const handleInvoiceCreated = async (invoice) => {
+  try {
+    // Get user by Stripe customer ID
+    const user = await db('users')
+      .where({ stripe_customer_id: invoice.customer })
+      .first();
+    
+    if (!user) {
+      console.error('No user found for customer:', invoice.customer);
+      return;
+    }
+    
+    // Check if invoice already exists
+    const existing = await db('invoices')
+      .where({ stripe_invoice_id: invoice.id })
+      .first();
+    
+    if (existing) return;
+    
+    // Create invoice record
+    await db('invoices').insert({
+      id: `INV-${Date.now()}`,
+      client_id: user.id,
+      stripe_invoice_id: invoice.id,
+      stripe_customer_id: invoice.customer,
+      date: new Date(invoice.created * 1000),
+      due_date: invoice.due_date ? new Date(invoice.due_date * 1000) : null,
+      amount: invoice.subtotal / 100,
+      tax: invoice.tax ? invoice.tax / 100 : 0,
+      total: invoice.total / 100,
+      status: invoice.status,
+      description: invoice.description || 'Subscription Invoice',
+      items: JSON.stringify(invoice.lines.data.map(line => ({
+        description: line.description,
+        amount: line.amount / 100,
+        quantity: line.quantity
+      }))),
+      payment_method: invoice.payment_settings?.payment_method_types?.[0] || 'card'
+    });
+  } catch (error) {
+    console.error('Handle invoice created error:', error);
+  }
+};
+
+const handleInvoicePaymentSucceeded = async (invoice) => {
+  try {
+    // Update invoice status
+    await db('invoices')
+      .where({ stripe_invoice_id: invoice.id })
+      .update({
+        status: 'paid',
+        paid_date: new Date(),
+        stripe_payment_intent_id: invoice.payment_intent,
+        receipt_url: invoice.hosted_invoice_url,
+        updated_at: new Date()
+      });
+    
+    // Get user for notification
+    const user = await db('users')
+      .where({ stripe_customer_id: invoice.customer })
+      .first();
+    
+    if (user) {
+      // Send payment confirmation email
+      await emailService.sendCustomEmail(
+        user.email,
+        'Payment Received - Thank You!',
+        `
+        <h2>Payment Confirmation</h2>
+        <p>Hi ${user.name},</p>
+        <p>We've successfully received your payment of $${(invoice.total / 100).toFixed(2)}.</p>
+        <p>Invoice ID: ${invoice.number || invoice.id}</p>
+        <p>You can view your invoice here: <a href="${invoice.hosted_invoice_url}">View Invoice</a></p>
+        <p>Thank you for your continued support!</p>
+        `,
+        { template_id: 'payment_success' }
+      );
+      
+      // Send real-time notification
+      const io = req.app.get('io');
+      io.to(user.id).emit('payment-success', {
+        invoiceId: invoice.id,
+        amount: invoice.total / 100,
+        message: 'Payment received successfully!'
+      });
+    }
+  } catch (error) {
+    console.error('Handle invoice payment succeeded error:', error);
+  }
+};
+
+const handleInvoicePaymentFailed = async (invoice) => {
+  try {
+    // Update invoice status
+    await db('invoices')
+      .where({ stripe_invoice_id: invoice.id })
+      .update({
+        status: 'failed',
+        updated_at: new Date()
+      });
+    
+    // Get user for notification
+    const user = await db('users')
+      .where({ stripe_customer_id: invoice.customer })
+      .first();
+    
+    if (user) {
+      // Send payment failure email
+      await emailService.sendCustomEmail(
+        user.email,
+        'Payment Failed - Action Required',
+        `
+        <h2>Payment Failed</h2>
+        <p>Hi ${user.name},</p>
+        <p>We were unable to process your payment of $${(invoice.total / 100).toFixed(2)}.</p>
+        <p>Please update your payment method to avoid service interruption.</p>
+        <p><a href="${process.env.FRONTEND_URL}/billing">Update Payment Method</a></p>
+        `,
+        { template_id: 'payment_failed' }
+      );
+    }
+  } catch (error) {
+    console.error('Handle invoice payment failed error:', error);
+  }
+};
+
+const handleSubscriptionCreated = async (subscription) => {
+  try {
+    const user = await db('users')
+      .where({ stripe_customer_id: subscription.customer })
+      .first();
+    
+    if (!user) return;
+    
+    await createOrUpdateSubscription(subscription, user.id);
+  } catch (error) {
+    console.error('Handle subscription created error:', error);
+  }
+};
+
+const handleSubscriptionUpdated = async (subscription) => {
+  try {
+    await db('subscriptions')
+      .where({ stripe_subscription_id: subscription.id })
+      .update({
+        status: subscription.status,
+        amount: subscription.items.data[0].price.unit_amount / 100,
+        next_billing_date: new Date(subscription.current_period_end * 1000),
+        canceled_at: subscription.canceled_at ? new Date(subscription.canceled_at * 1000) : null,
+        updated_at: new Date()
+      });
+  } catch (error) {
+    console.error('Handle subscription updated error:', error);
+  }
+};
+
+const handleSubscriptionDeleted = async (subscription) => {
+  try {
+    await db('subscriptions')
+      .where({ stripe_subscription_id: subscription.id })
+      .update({
+        status: 'canceled',
+        canceled_at: new Date(),
+        updated_at: new Date()
+      });
+    
+    // Update user's subscription plan
+    const sub = await db('subscriptions')
+      .where({ stripe_subscription_id: subscription.id })
+      .first();
+    
+    if (sub) {
+      await db('users')
+        .where({ id: sub.client_id })
+        .update({
+          subscription_plan: 'basic',
+          updated_at: new Date()
+        });
+    }
+  } catch (error) {
+    console.error('Handle subscription deleted error:', error);
+  }
+};
+
+const handlePaymentIntentSucceeded = async (paymentIntent) => {
+  try {
+    await recordPayment(paymentIntent);
+  } catch (error) {
+    console.error('Handle payment intent succeeded error:', error);
+  }
+};
+
+const handlePaymentIntentFailed = async (paymentIntent) => {
+  try {
+    // Log failed payment attempt
+    const user = await db('users')
+      .where({ stripe_customer_id: paymentIntent.customer })
+      .first();
+    
+    if (user) {
+      await db('audit_logs').insert({
+        user_id: user.id,
+        action: 'payment_failed',
+        resource: 'payment',
+        resource_id: paymentIntent.id,
+        details: `Payment failed: ${paymentIntent.last_payment_error?.message || 'Unknown error'}`,
+        metadata: JSON.stringify({
+          amount: paymentIntent.amount / 100,
+          error: paymentIntent.last_payment_error
+        })
+      });
+    }
+  } catch (error) {
+    console.error('Handle payment intent failed error:', error);
+  }
+};
+
+// Helper functions
+const createOrUpdateSubscription = async (subscription, userId) => {
+  const existing = await db('subscriptions')
+    .where({ stripe_subscription_id: subscription.id })
+    .first();
+  
+  const subscriptionData = {
+    client_id: userId,
+    name: subscription.items.data[0].price.nickname || 'Premium Subscription',
+    amount: subscription.items.data[0].price.unit_amount / 100,
+    frequency: subscription.items.data[0].price.recurring.interval,
+    status: subscription.status,
+    start_date: new Date(subscription.start_date * 1000),
+    next_billing_date: new Date(subscription.current_period_end * 1000),
+    stripe_subscription_id: subscription.id,
+    stripe_price_id: subscription.items.data[0].price.id,
+    features: JSON.stringify(subscription.metadata.features || [])
+  };
+  
+  if (existing) {
+    await db('subscriptions')
+      .where({ id: existing.id })
+      .update({ ...subscriptionData, updated_at: new Date() });
+  } else {
+    await db('subscriptions')
+      .insert({
+        id: `SUB-${Date.now()}`,
+        ...subscriptionData
+      });
+  }
+  
+  // Update user's subscription plan
+  const planMap = {
+    'price_basic': 'basic',
+    'price_professional': 'professional',
+    'price_premium': 'premium'
+  };
+  
+  const plan = planMap[subscription.items.data[0].price.id] || 'premium';
+  
+  await db('users')
+    .where({ id: userId })
+    .update({
+      subscription_plan: plan,
+      updated_at: new Date()
+    });
+};
+
+const recordPayment = async (paymentIntent, userId = null) => {
+  // Get user if not provided
+  if (!userId && paymentIntent.customer) {
+    const user = await db('users')
+      .where({ stripe_customer_id: paymentIntent.customer })
+      .first();
+    userId = user?.id;
+  }
+  
+  if (!userId) return;
+  
+  // Check if payment already recorded
+  const existing = await db('payments')
+    .where({ stripe_payment_id: paymentIntent.id })
+    .first();
+  
+  if (existing) return;
+  
+  // Record payment
+  await db('payments').insert({
+    id: `PAY-${Date.now()}`,
+    client_id: userId,
+    amount: paymentIntent.amount / 100,
+    date: new Date(),
+    method: paymentIntent.payment_method_types[0] || 'card',
+    status: 'succeeded',
+    stripe_payment_id: paymentIntent.id,
+    receipt: paymentIntent.charges.data[0]?.receipt_url
+  });
+};
+
+// Get invoices
+const getInvoices = async (req, res) => {
+  try {
+    const { user } = req;
+    const { 
+      clientId,
+      status,
+      startDate,
+      endDate,
+      page = 1,
+      limit = 20,
+      sortBy = 'date',
+      sortOrder = 'desc'
+    } = req.query;
+    
+    let query = db('invoices');
+    
+    // Filter by user role
+    const userRoles = JSON.parse(user.roles);
+    
+    if (userRoles.includes('client')) {
+      query = query.where('client_id', user.id);
+    } else if (clientId) {
+      query = query.where('client_id', clientId);
+    } else if (userRoles.includes('specialist') && !userRoles.includes('admin')) {
+      // Specialists can see invoices for their clients
+      const clientIds = JSON.parse(user.client_ids || '[]');
+      query = query.whereIn('client_id', clientIds);
+    }
+    
+    // Apply filters
+    if (status) {
+      query = query.where('status', status);
+    }
+    
+    if (startDate) {
+      query = query.where('date', '>=', startDate);
+    }
+    
+    if (endDate) {
+      query = query.where('date', '<=', endDate);
+    }
+    
+    // Get count
+    const [{ count }] = await query.clone().count('* as count');
+    
+    // Get paginated results
+    const offset = (page - 1) * limit;
+    const invoices = await query
+      .select('invoices.*', 'users.name as client_name')
+      .leftJoin('users', 'invoices.client_id', 'users.id')
+      .orderBy(sortBy, sortOrder)
+      .limit(limit)
+      .offset(offset);
+    
+    // Parse JSON fields
+    const formattedInvoices = invoices.map(invoice => ({
+      ...invoice,
+      items: JSON.parse(invoice.items || '[]')
+    }));
+    
+    res.json({
+      invoices: formattedInvoices,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: parseInt(count),
+        pages: Math.ceil(count / limit)
+      }
+    });
+  } catch (error) {
+    console.error('Get invoices error:', error);
+    res.status(500).json({ error: 'Failed to fetch invoices' });
+  }
+};
+
+// Get subscriptions
+const getSubscriptions = async (req, res) => {
+  try {
+    const { user } = req;
+    const { clientId, status, page = 1, limit = 20 } = req.query;
+    
+    let query = db('subscriptions');
+    
+    // Filter by user role
+    const userRoles = JSON.parse(user.roles);
+    
+    if (userRoles.includes('client')) {
+      query = query.where('client_id', user.id);
+    } else if (clientId) {
+      query = query.where('client_id', clientId);
+    } else if (userRoles.includes('specialist') && !userRoles.includes('admin')) {
+      const clientIds = JSON.parse(user.client_ids || '[]');
+      query = query.whereIn('client_id', clientIds);
+    }
+    
+    if (status) {
+      query = query.where('status', status);
+    }
+    
+    // Get count
+    const [{ count }] = await query.clone().count('* as count');
+    
+    // Get paginated results
+    const offset = (page - 1) * limit;
+    const subscriptions = await query
+      .select('subscriptions.*', 'users.name as client_name')
+      .leftJoin('users', 'subscriptions.client_id', 'users.id')
+      .orderBy('created_at', 'desc')
+      .limit(limit)
+      .offset(offset);
+    
+    // Parse JSON fields
+    const formattedSubscriptions = subscriptions.map(sub => ({
+      ...sub,
+      features: JSON.parse(sub.features || '[]')
+    }));
+    
+    res.json({
+      subscriptions: formattedSubscriptions,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: parseInt(count),
+        pages: Math.ceil(count / limit)
+      }
+    });
+  } catch (error) {
+    console.error('Get subscriptions error:', error);
+    res.status(500).json({ error: 'Failed to fetch subscriptions' });
+  }
+};
+
+// Get payment methods
+const getPaymentMethods = async (req, res) => {
+  try {
+    const { user } = req;
+    
+    if (!user.stripe_customer_id) {
+      return res.json({ paymentMethods: [] });
+    }
+    
+    // Get payment methods from Stripe
+    const paymentMethods = await stripe.paymentMethods.list({
+      customer: user.stripe_customer_id,
+      type: 'card'
+    });
+    
+    // Get default payment method
+    const customer = await stripe.customers.retrieve(user.stripe_customer_id);
+    const defaultPaymentMethodId = customer.invoice_settings?.default_payment_method;
+    
+    // Format response
+    const formattedMethods = paymentMethods.data.map(pm => ({
+      id: pm.id,
+      brand: pm.card.brand,
+      last4: pm.card.last4,
+      expMonth: pm.card.exp_month,
+      expYear: pm.card.exp_year,
+      isDefault: pm.id === defaultPaymentMethodId
+    }));
+    
+    res.json({ paymentMethods: formattedMethods });
+  } catch (error) {
+    console.error('Get payment methods error:', error);
+    res.status(500).json({ error: 'Failed to fetch payment methods' });
+  }
+};
+
+// Add payment method
+const addPaymentMethod = async (req, res) => {
+  try {
+    const { user } = req;
+    const { paymentMethodId, setAsDefault } = req.body;
+    
+    if (!paymentMethodId) {
+      return res.status(400).json({ error: 'Payment method ID required' });
+    }
+    
+    // Create Stripe customer if doesn't exist
+    let stripeCustomerId = user.stripe_customer_id;
+    
+    if (!stripeCustomerId) {
+      const customer = await stripe.customers.create({
+        email: user.email,
+        name: user.name,
+        metadata: { userId: user.id }
+      });
+      
+      await db('users')
+        .where({ id: user.id })
+        .update({ stripe_customer_id: customer.id });
+      
+      stripeCustomerId = customer.id;
+    }
+    
+    // Attach payment method to customer
+    await stripe.paymentMethods.attach(paymentMethodId, {
+      customer: stripeCustomerId
+    });
+    
+    // Set as default if requested
+    if (setAsDefault) {
+      await stripe.customers.update(stripeCustomerId, {
+        invoice_settings: {
+          default_payment_method: paymentMethodId
+        }
+      });
+    }
+    
+    res.json({ 
+      message: 'Payment method added successfully',
+      paymentMethodId 
+    });
+  } catch (error) {
+    console.error('Add payment method error:', error);
+    res.status(500).json({ error: 'Failed to add payment method' });
+  }
+};
+
+// Remove payment method
+const removePaymentMethod = async (req, res) => {
+  try {
+    const { paymentMethodId } = req.params;
+    const { user } = req;
+    
+    if (!user.stripe_customer_id) {
+      return res.status(400).json({ error: 'No payment methods found' });
+    }
+    
+    // Detach payment method
+    await stripe.paymentMethods.detach(paymentMethodId);
+    
+    res.json({ message: 'Payment method removed successfully' });
+  } catch (error) {
+    console.error('Remove payment method error:', error);
+    res.status(500).json({ error: 'Failed to remove payment method' });
+  }
+};
+
+// Cancel subscription
+const cancelSubscription = async (req, res) => {
+  try {
+    const { subscriptionId } = req.params;
+    const { user } = req;
+    const { immediately = false } = req.body;
+    
+    // Get subscription from database
+    const subscription = await db('subscriptions')
+      .where({ id: subscriptionId })
+      .first();
+    
+    if (!subscription) {
+      return res.status(404).json({ error: 'Subscription not found' });
+    }
+    
+    // Check authorization
+    const userRoles = JSON.parse(user.roles);
+    if (!userRoles.includes('admin') && subscription.client_id !== user.id) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    
+    // Cancel in Stripe
+    if (subscription.stripe_subscription_id) {
+      if (immediately) {
+        await stripe.subscriptions.del(subscription.stripe_subscription_id);
+      } else {
+        await stripe.subscriptions.update(subscription.stripe_subscription_id, {
+          cancel_at_period_end: true
+        });
+      }
+    }
+    
+    // Update database
+    await db('subscriptions')
+      .where({ id: subscriptionId })
+      .update({
+        status: immediately ? 'canceled' : 'canceling',
+        canceled_at: immediately ? new Date() : null,
+        updated_at: new Date()
+      });
+    
+    res.json({ 
+      message: immediately 
+        ? 'Subscription canceled immediately' 
+        : 'Subscription will be canceled at the end of the billing period'
+    });
+  } catch (error) {
+    console.error('Cancel subscription error:', error);
+    res.status(500).json({ error: 'Failed to cancel subscription' });
+  }
+};
+
+// Create custom invoice
+const createInvoice = async (req, res) => {
+  const trx = await db.transaction();
+  
+  try {
+    const { user } = req;
+    const { 
+      clientId,
+      items,
+      dueDate,
+      description,
+      tax = 0,
+      sendEmail = true
+    } = req.body;
+    
+    // Validate permissions
+    const userRoles = JSON.parse(user.roles);
+    if (!userRoles.includes('specialist') && !userRoles.includes('admin')) {
+      await trx.rollback();
+      return res.status(403).json({ error: 'Only specialists and admins can create invoices' });
+    }
+    
+    // Validate client access
+    if (userRoles.includes('specialist') && !userRoles.includes('admin')) {
+      const clientIds = JSON.parse(user.client_ids || '[]');
+      if (!clientIds.includes(clientId)) {
+        await trx.rollback();
+        return res.status(403).json({ error: 'You do not have access to this client' });
+      }
+    }
+    
+    // Calculate totals
+    const subtotal = items.reduce((sum, item) => sum + (item.amount * item.quantity), 0);
+    const taxAmount = subtotal * (tax / 100);
+    const total = subtotal + taxAmount;
+    
+    // Create invoice
+    const invoiceId = `INV-${Date.now()}`;
+    const [invoice] = await trx('invoices')
+      .insert({
+        id: invoiceId,
+        client_id: clientId,
+        issued_by: user.id,
+        date: new Date(),
+        due_date: dueDate,
+        amount: subtotal,
+        tax: taxAmount,
+        total,
+        status: 'pending',
+        description,
+        items: JSON.stringify(items)
+      })
+      .returning('*');
+    
+    // Get client info for email
+    const client = await trx('users')
+      .where({ id: clientId })
+      .first();
+    
+    // Send invoice email if requested
+    if (sendEmail && client) {
+      await emailService.sendInvoiceEmail(
+        client.email,
+        client.name,
+        {
+          id: invoiceId,
+          date: invoice.date,
+          dueDate: invoice.due_date,
+          amount: subtotal,
+          tax: taxAmount,
+          total,
+          items,
+          status: 'pending'
+        }
+      );
+    }
+    
+    // Log audit
+    await trx('audit_logs').insert({
+      user_id: user.id,
+      action: 'create_invoice',
+      resource: 'invoice',
+      resource_id: invoiceId,
+      details: `Created invoice for $${total.toFixed(2)}`,
+      ip_address: req.ip,
+      user_agent: req.get('user-agent'),
+      metadata: JSON.stringify({ 
+        clientId,
+        total,
+        itemCount: items.length
+      })
+    });
+    
+    await trx.commit();
+    
+    res.status(201).json({
+      invoice: {
+        ...invoice,
+        items: JSON.parse(invoice.items)
+      },
+      message: 'Invoice created successfully'
+    });
+  } catch (error) {
+    await trx.rollback();
+    console.error('Create invoice error:', error);
+    res.status(500).json({ error: 'Failed to create invoice' });
+  }
+};
+
+// Get billing statistics
+const getBillingStats = async (req, res) => {
+  try {
+    const { user } = req;
+    const { clientId, startDate, endDate } = req.query;
+    
+    let query = db('invoices');
+    
+    // Apply filters based on role
+    const userRoles = JSON.parse(user.roles);
+    
+    if (userRoles.includes('client')) {
+      query = query.where('client_id', user.id);
+    } else if (clientId) {
+      query = query.where('client_id', clientId);
+    } else if (userRoles.includes('specialist') && !userRoles.includes('admin')) {
+      const clientIds = JSON.parse(user.client_ids || '[]');
+      query = query.whereIn('client_id', clientIds);
+    }
+    
+    if (startDate) {
+      query = query.where('date', '>=', startDate);
+    }
+    
+    if (endDate) {
+      query = query.where('date', '<=', endDate);
+    }
+    
+    // Get statistics
+    const [stats] = await query
+      .select(
+        db.raw('COUNT(*) as total_invoices'),
+        db.raw('COUNT(CASE WHEN status = ? THEN 1 END) as paid_invoices', ['paid']),
+        db.raw('COUNT(CASE WHEN status = ? THEN 1 END) as pending_invoices', ['pending']),
+        db.raw('COUNT(CASE WHEN status = ? THEN 1 END) as overdue_invoices', ['overdue']),
+        db.raw('SUM(total) as total_revenue'),
+        db.raw('SUM(CASE WHEN status = ? THEN total END) as paid_revenue', ['paid']),
+        db.raw('SUM(CASE WHEN status = ? THEN total END) as pending_revenue', ['pending']),
+        db.raw('AVG(total) as average_invoice')
+      )
+      .first();
+    
+    // Get monthly breakdown
+    const monthlyBreakdown = await query.clone()
+      .select(
+        db.raw("DATE_TRUNC('month', date) as month"),
+        db.raw('COUNT(*) as invoices'),
+        db.raw('SUM(total) as revenue')
+      )
+      .groupBy(db.raw("DATE_TRUNC('month', date)"))
+      .orderBy('month', 'desc')
+      .limit(12);
+    
+    // Get active subscriptions count
+    let subsQuery = db('subscriptions').where('status', 'active');
+    
+    if (userRoles.includes('client')) {
+      subsQuery = subsQuery.where('client_id', user.id);
+    } else if (clientId) {
+      subsQuery = subsQuery.where('client_id', clientId);
+    } else if (userRoles.includes('specialist') && !userRoles.includes('admin')) {
+      const clientIds = JSON.parse(user.client_ids || '[]');
+      subsQuery = subsQuery.whereIn('client_id', clientIds);
+    }
+    
+    const [{ subscriptionCount }] = await subsQuery.count('* as subscriptionCount');
+    
+    res.json({
+      overview: {
+        totalInvoices: parseInt(stats.total_invoices),
+        paidInvoices: parseInt(stats.paid_invoices),
+        pendingInvoices: parseInt(stats.pending_invoices),
+        overdueInvoices: parseInt(stats.overdue_invoices),
+        totalRevenue: parseFloat(stats.total_revenue) || 0,
+        paidRevenue: parseFloat(stats.paid_revenue) || 0,
+        pendingRevenue: parseFloat(stats.pending_revenue) || 0,
+        averageInvoice: parseFloat(stats.average_invoice) || 0,
+        activeSubscriptions: parseInt(subscriptionCount)
+      },
+      monthlyBreakdown: monthlyBreakdown.map(m => ({
+        month: m.month,
+        invoices: parseInt(m.invoices),
+        revenue: parseFloat(m.revenue) || 0
+      })),
+      period: {
+        start: startDate || 'all time',
+        end: endDate || 'present'
+      }
+    });
+  } catch (error) {
+    console.error('Get billing stats error:', error);
+    res.status(500).json({ error: 'Failed to fetch billing statistics' });
+  }
+};
+
+module.exports = {
+  createCheckoutSession,
+  handleWebhook,
+  getInvoices,
+  getSubscriptions,
+  getPaymentMethods,
+  addPaymentMethod,
+  removePaymentMethod,
+  cancelSubscription,
+  createInvoice,
+  getBillingStats
+};

@@ -1,0 +1,1003 @@
+const { db } = require('../config/database');
+const PDFDocument = require('pdfkit');
+const ExcelJS = require('exceljs');
+const fs = require('fs').promises;
+const path = require('path');
+
+// Generate comprehensive report
+const generateReport = async (req, res) => {
+  try {
+    const { user } = req;
+    const { 
+      type = 'comprehensive',
+      clientId,
+      startDate,
+      endDate,
+      format = 'pdf'
+    } = req.body;
+    
+    // Determine target client
+    let targetClientId;
+    const userRoles = JSON.parse(user.roles);
+    
+    if (userRoles.includes('client')) {
+      targetClientId = user.id;
+    } else {
+      targetClientId = clientId;
+      if (!targetClientId) {
+        return res.status(400).json({ error: 'Client ID required' });
+      }
+      
+      // Check access for specialists
+      if (userRoles.includes('specialist') && !userRoles.includes('admin')) {
+        const clientIds = JSON.parse(user.client_ids || '[]');
+        if (!clientIds.includes(targetClientId)) {
+          return res.status(403).json({ error: 'Access denied' });
+        }
+      }
+    }
+    
+    // Validate date range
+    if (!startDate || !endDate) {
+      return res.status(400).json({ error: 'Start date and end date are required' });
+    }
+    
+    // Get client information
+    const client = await db('users')
+      .select('id', 'name', 'email', 'phone', 'created_at')
+      .where({ id: targetClientId })
+      .first();
+    
+    if (!client) {
+      return res.status(404).json({ error: 'Client not found' });
+    }
+    
+    // Gather report data based on type
+    let reportData = {
+      client,
+      period: { startDate, endDate },
+      generatedBy: user.name,
+      generatedAt: new Date()
+    };
+    
+    switch (type) {
+      case 'progress':
+        reportData = await getProgressReportData(targetClientId, startDate, endDate, reportData);
+        break;
+      case 'measurements':
+        reportData = await getMeasurementsReportData(targetClientId, startDate, endDate, reportData);
+        break;
+      case 'workouts':
+        reportData = await getWorkoutsReportData(targetClientId, startDate, endDate, reportData);
+        break;
+      case 'nutrition':
+        reportData = await getNutritionReportData(targetClientId, startDate, endDate, reportData);
+        break;
+      case 'comprehensive':
+        reportData = await getComprehensiveReportData(targetClientId, startDate, endDate, reportData);
+        break;
+      default:
+        return res.status(400).json({ error: 'Invalid report type' });
+    }
+    
+    // Generate report in requested format
+    let reportPath;
+    let contentType;
+    
+    switch (format) {
+      case 'pdf':
+        reportPath = await generatePDFReport(reportData, type);
+        contentType = 'application/pdf';
+        break;
+      case 'excel':
+        reportPath = await generateExcelReport(reportData, type);
+        contentType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+        break;
+      case 'json':
+        // Return JSON directly
+        return res.json(reportData);
+      default:
+        return res.status(400).json({ error: 'Invalid format' });
+    }
+    
+    // Log audit
+    await db('audit_logs').insert({
+      user_id: user.id,
+      action: 'generate_report',
+      resource: 'report',
+      resource_id: targetClientId,
+      details: `Generated ${type} report for client ${client.name}`,
+      ip_address: req.ip,
+      user_agent: req.get('user-agent'),
+      metadata: JSON.stringify({ 
+        reportType: type,
+        format,
+        period: { startDate, endDate }
+      })
+    });
+    
+    // Send file
+    res.contentType(contentType);
+    res.setHeader('Content-Disposition', `attachment; filename="${type}-report-${Date.now()}.${format}"`);
+    res.sendFile(reportPath, async (err) => {
+      // Clean up temp file
+      try {
+        await fs.unlink(reportPath);
+      } catch (error) {
+        console.error('Failed to delete temp file:', error);
+      }
+    });
+  } catch (error) {
+    console.error('Generate report error:', error);
+    res.status(500).json({ error: 'Failed to generate report' });
+  }
+};
+
+// Get progress report data
+const getProgressReportData = async (clientId, startDate, endDate, baseData) => {
+  // Get measurements progress
+  const measurements = await db('measurements')
+    .where({ client_id: clientId })
+    .whereBetween('date', [startDate, endDate])
+    .orderBy('date', 'asc');
+  
+  // Get goal progress
+  const goals = await db('goals')
+    .where({ client_id: clientId })
+    .where(function() {
+      this.whereBetween('created_at', [startDate, endDate])
+        .orWhereBetween('completed_date', [startDate, endDate]);
+    });
+  
+  // Get workout completion rate
+  const workoutStats = await db('workouts')
+    .where({ client_id: clientId })
+    .whereBetween('created_at', [startDate, endDate])
+    .select(
+      db.raw('COUNT(*) as total'),
+      db.raw('COUNT(CASE WHEN completed = true THEN 1 END) as completed')
+    )
+    .first();
+  
+  // Calculate key metrics
+  const firstMeasurement = measurements[0];
+  const lastMeasurement = measurements[measurements.length - 1];
+  
+  const progress = {
+    weight: {
+      start: firstMeasurement?.weight || 0,
+      end: lastMeasurement?.weight || 0,
+      change: lastMeasurement && firstMeasurement 
+        ? lastMeasurement.weight - firstMeasurement.weight 
+        : 0
+    },
+    bodyFat: {
+      start: firstMeasurement?.body_fat || 0,
+      end: lastMeasurement?.body_fat || 0,
+      change: lastMeasurement && firstMeasurement && lastMeasurement.body_fat && firstMeasurement.body_fat
+        ? lastMeasurement.body_fat - firstMeasurement.body_fat 
+        : 0
+    },
+    workouts: {
+      total: parseInt(workoutStats.total),
+      completed: parseInt(workoutStats.completed),
+      completionRate: workoutStats.total > 0 
+        ? Math.round((workoutStats.completed / workoutStats.total) * 100)
+        : 0
+    },
+    goals: {
+      total: goals.length,
+      completed: goals.filter(g => g.completed).length,
+      completionRate: goals.length > 0 
+        ? Math.round((goals.filter(g => g.completed).length / goals.length) * 100)
+        : 0
+    }
+  };
+  
+  return {
+    ...baseData,
+    measurements,
+    goals,
+    progress,
+    summary: generateProgressSummary(progress)
+  };
+};
+
+// Get measurements report data
+const getMeasurementsReportData = async (clientId, startDate, endDate, baseData) => {
+  const measurements = await db('measurements')
+    .where({ client_id: clientId })
+    .whereBetween('date', [startDate, endDate])
+    .orderBy('date', 'asc');
+  
+  // Parse JSON fields
+  const formattedMeasurements = measurements.map(m => ({
+    ...m,
+    circumference: JSON.parse(m.circumference || '{}'),
+    caliper: JSON.parse(m.caliper || '{}')
+  }));
+  
+  // Calculate trends
+  const trends = calculateMeasurementTrends(formattedMeasurements);
+  
+  // Get body composition estimates
+  const bodyComposition = formattedMeasurements.map(m => ({
+    date: m.date,
+    weight: m.weight,
+    bodyFat: m.body_fat,
+    leanMass: m.weight && m.body_fat 
+      ? m.weight * (1 - m.body_fat / 100) 
+      : null,
+    fatMass: m.weight && m.body_fat 
+      ? m.weight * (m.body_fat / 100) 
+      : null
+  }));
+  
+  return {
+    ...baseData,
+    measurements: formattedMeasurements,
+    trends,
+    bodyComposition,
+    circumferenceHistory: extractCircumferenceHistory(formattedMeasurements),
+    caliperHistory: extractCaliperHistory(formattedMeasurements)
+  };
+};
+
+// Get workouts report data
+const getWorkoutsReportData = async (clientId, startDate, endDate, baseData) => {
+  const workouts = await db('workouts')
+    .where({ client_id: clientId })
+    .whereBetween('created_at', [startDate, endDate])
+    .orderBy('created_at', 'desc');
+  
+  // Parse exercises and calculate statistics
+  const workoutStats = {
+    total: workouts.length,
+    completed: workouts.filter(w => w.completed).length,
+    totalDuration: 0,
+    totalCalories: 0,
+    avgMood: 0,
+    exerciseFrequency: {},
+    weeklyDistribution: {},
+    progressionData: {}
+  };
+  
+  let moodCount = 0;
+  
+  workouts.forEach(workout => {
+    const exercises = JSON.parse(workout.exercises || '[]');
+    
+    if (workout.completed) {
+      workoutStats.totalDuration += workout.duration || 0;
+      workoutStats.totalCalories += workout.calories_burned || 0;
+      
+      if (workout.mood_feedback) {
+        workoutStats.avgMood += workout.mood_feedback;
+        moodCount++;
+      }
+      
+      // Track exercise frequency
+      exercises.forEach(exercise => {
+        if (!workoutStats.exerciseFrequency[exercise.name]) {
+          workoutStats.exerciseFrequency[exercise.name] = 0;
+        }
+        workoutStats.exerciseFrequency[exercise.name]++;
+        
+        // Track progression
+        if (!workoutStats.progressionData[exercise.name]) {
+          workoutStats.progressionData[exercise.name] = [];
+        }
+        
+        if (workout.completed_date) {
+          workoutStats.progressionData[exercise.name].push({
+            date: workout.completed_date,
+            weight: exercise.actualWeight || exercise.weight,
+            reps: exercise.actualReps || exercise.reps,
+            sets: exercise.actualSets || exercise.sets
+          });
+        }
+      });
+    }
+    
+    // Weekly distribution
+    if (workout.scheduled_date) {
+      const week = getWeekNumber(new Date(workout.scheduled_date));
+      if (!workoutStats.weeklyDistribution[week]) {
+        workoutStats.weeklyDistribution[week] = { scheduled: 0, completed: 0 };
+      }
+      workoutStats.weeklyDistribution[week].scheduled++;
+      if (workout.completed) {
+        workoutStats.weeklyDistribution[week].completed++;
+      }
+    }
+  });
+  
+  if (moodCount > 0) {
+    workoutStats.avgMood = Math.round(workoutStats.avgMood / moodCount * 10) / 10;
+  }
+  
+  // Get top exercises
+  const topExercises = Object.entries(workoutStats.exerciseFrequency)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([name, count]) => ({ name, count }));
+  
+  return {
+    ...baseData,
+    workouts: workouts.map(w => ({
+      ...w,
+      exercises: JSON.parse(w.exercises || '[]')
+    })),
+    statistics: workoutStats,
+    topExercises,
+    completionRate: workoutStats.total > 0 
+      ? Math.round((workoutStats.completed / workoutStats.total) * 100)
+      : 0
+  };
+};
+
+// Get nutrition report data
+const getNutritionReportData = async (clientId, startDate, endDate, baseData) => {
+  // Get current nutrition plan
+  const nutritionPlan = await db('nutrition')
+    .where({ client_id: clientId })
+    .first();
+  
+  if (!nutritionPlan) {
+    return {
+      ...baseData,
+      nutritionPlan: null,
+      logs: [],
+      compliance: {},
+      averages: {}
+    };
+  }
+  
+  // Get nutrition logs
+  const logs = await db('nutrition_logs')
+    .where({ client_id: clientId })
+    .whereBetween('date', [startDate, endDate])
+    .orderBy('date', 'asc');
+  
+  // Calculate compliance and averages
+  const targets = {
+    protein: JSON.parse(nutritionPlan.protein).target,
+    carbs: JSON.parse(nutritionPlan.carbs).target,
+    fat: JSON.parse(nutritionPlan.fat).target,
+    calories: JSON.parse(nutritionPlan.calories).target,
+    fiber: JSON.parse(nutritionPlan.fiber).target,
+    water: JSON.parse(nutritionPlan.water).target
+  };
+  
+  const compliance = {
+    protein: [],
+    carbs: [],
+    fat: [],
+    calories: [],
+    fiber: [],
+    water: [],
+    overall: []
+  };
+  
+  const totals = {
+    protein: 0,
+    carbs: 0,
+    fat: 0,
+    calories: 0,
+    fiber: 0,
+    water: 0
+  };
+  
+  logs.forEach(log => {
+    const dailyCompliance = {};
+    let complianceSum = 0;
+    let complianceCount = 0;
+    
+    ['protein', 'carbs', 'fat', 'calories', 'fiber', 'water'].forEach(macro => {
+      if (targets[macro] > 0 && log[macro] !== null) {
+        const percentage = Math.min(100, Math.round((log[macro] / targets[macro]) * 100));
+        compliance[macro].push({ date: log.date, value: percentage });
+        dailyCompliance[macro] = percentage;
+        complianceSum += percentage;
+        complianceCount++;
+      }
+      
+      totals[macro] += log[macro] || 0;
+    });
+    
+    if (complianceCount > 0) {
+      compliance.overall.push({
+        date: log.date,
+        value: Math.round(complianceSum / complianceCount)
+      });
+    }
+  });
+  
+  // Calculate averages
+  const averages = {};
+  Object.keys(totals).forEach(macro => {
+    averages[macro] = logs.length > 0 ? Math.round(totals[macro] / logs.length) : 0;
+  });
+  
+  return {
+    ...baseData,
+    nutritionPlan: {
+      ...nutritionPlan,
+      protein: JSON.parse(nutritionPlan.protein),
+      carbs: JSON.parse(nutritionPlan.carbs),
+      fat: JSON.parse(nutritionPlan.fat),
+      calories: JSON.parse(nutritionPlan.calories),
+      fiber: JSON.parse(nutritionPlan.fiber),
+      water: JSON.parse(nutritionPlan.water),
+      mealPlan: JSON.parse(nutritionPlan.meal_plan),
+      restrictions: JSON.parse(nutritionPlan.restrictions || '[]'),
+      supplements: JSON.parse(nutritionPlan.supplements || '[]')
+    },
+    logs,
+    compliance,
+    averages,
+    targets
+  };
+};
+
+// Get comprehensive report data
+const getComprehensiveReportData = async (clientId, startDate, endDate, baseData) => {
+  const [progressData, measurementsData, workoutsData, nutritionData] = await Promise.all([
+    getProgressReportData(clientId, startDate, endDate, {}),
+    getMeasurementsReportData(clientId, startDate, endDate, {}),
+    getWorkoutsReportData(clientId, startDate, endDate, {}),
+    getNutritionReportData(clientId, startDate, endDate, {})
+  ]);
+  
+  return {
+    ...baseData,
+    progress: progressData,
+    measurements: measurementsData,
+    workouts: workoutsData,
+    nutrition: nutritionData,
+    recommendations: generateRecommendations(progressData, measurementsData, workoutsData, nutritionData)
+  };
+};
+
+// Generate PDF report
+const generatePDFReport = async (data, type) => {
+  const doc = new PDFDocument({ margin: 50 });
+  const filename = `report-${type}-${Date.now()}.pdf`;
+  const filepath = path.join('/tmp', filename);
+  
+  doc.pipe(fs.createWriteStream(filepath));
+  
+  // Header
+  doc.fontSize(24).text('ClockWork Fitness Report', { align: 'center' });
+  doc.fontSize(18).text(type.charAt(0).toUpperCase() + type.slice(1) + ' Report', { align: 'center' });
+  doc.moveDown();
+  
+  // Client info
+  doc.fontSize(12);
+  doc.text(`Client: ${data.client.name}`);
+  doc.text(`Email: ${data.client.email}`);
+  doc.text(`Period: ${new Date(data.period.startDate).toLocaleDateString()} - ${new Date(data.period.endDate).toLocaleDateString()}`);
+  doc.text(`Generated by: ${data.generatedBy}`);
+  doc.text(`Generated on: ${new Date(data.generatedAt).toLocaleString()}`);
+  doc.moveDown();
+  
+  // Add content based on report type
+  switch (type) {
+    case 'progress':
+      addProgressContent(doc, data);
+      break;
+    case 'measurements':
+      addMeasurementsContent(doc, data);
+      break;
+    case 'workouts':
+      addWorkoutsContent(doc, data);
+      break;
+    case 'nutrition':
+      addNutritionContent(doc, data);
+      break;
+    case 'comprehensive':
+      addComprehensiveContent(doc, data);
+      break;
+  }
+  
+  doc.end();
+  
+  // Wait for PDF to be written
+  await new Promise((resolve) => {
+    doc.on('end', resolve);
+  });
+  
+  return filepath;
+};
+
+// Generate Excel report
+const generateExcelReport = async (data, type) => {
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = 'ClockWork Fitness';
+  workbook.created = new Date();
+  
+  // Add worksheets based on report type
+  switch (type) {
+    case 'progress':
+      addProgressWorksheets(workbook, data);
+      break;
+    case 'measurements':
+      addMeasurementsWorksheets(workbook, data);
+      break;
+    case 'workouts':
+      addWorkoutsWorksheets(workbook, data);
+      break;
+    case 'nutrition':
+      addNutritionWorksheets(workbook, data);
+      break;
+    case 'comprehensive':
+      addProgressWorksheets(workbook, data.progress);
+      addMeasurementsWorksheets(workbook, data.measurements);
+      addWorkoutsWorksheets(workbook, data.workouts);
+      addNutritionWorksheets(workbook, data.nutrition);
+      break;
+  }
+  
+  const filename = `report-${type}-${Date.now()}.xlsx`;
+  const filepath = path.join('/tmp', filename);
+  
+  await workbook.xlsx.writeFile(filepath);
+  
+  return filepath;
+};
+
+// Helper functions
+
+const generateProgressSummary = (progress) => {
+  const summary = [];
+  
+  if (progress.weight.change !== 0) {
+    summary.push(`Weight ${progress.weight.change > 0 ? 'gained' : 'lost'}: ${Math.abs(progress.weight.change).toFixed(1)} kg`);
+  }
+  
+  if (progress.bodyFat.change !== 0) {
+    summary.push(`Body fat ${progress.bodyFat.change > 0 ? 'increased' : 'decreased'}: ${Math.abs(progress.bodyFat.change).toFixed(1)}%`);
+  }
+  
+  summary.push(`Workout completion rate: ${progress.workouts.completionRate}%`);
+  summary.push(`Goals achieved: ${progress.goals.completed} of ${progress.goals.total}`);
+  
+  return summary;
+};
+
+const calculateMeasurementTrends = (measurements) => {
+  if (measurements.length < 2) return {};
+  
+  const trends = {
+    weight: { direction: 'stable', change: 0 },
+    bodyFat: { direction: 'stable', change: 0 },
+    measurements: {}
+  };
+  
+  // Weight trend
+  const firstWeight = measurements.find(m => m.weight)?.weight;
+  const lastWeight = [...measurements].reverse().find(m => m.weight)?.weight;
+  
+  if (firstWeight && lastWeight) {
+    trends.weight.change = lastWeight - firstWeight;
+    trends.weight.direction = trends.weight.change > 0.5 ? 'increasing' : 
+                              trends.weight.change < -0.5 ? 'decreasing' : 'stable';
+  }
+  
+  // Body fat trend
+  const firstBF = measurements.find(m => m.body_fat)?.body_fat;
+  const lastBF = [...measurements].reverse().find(m => m.body_fat)?.body_fat;
+  
+  if (firstBF && lastBF) {
+    trends.bodyFat.change = lastBF - firstBF;
+    trends.bodyFat.direction = trends.bodyFat.change > 0.5 ? 'increasing' : 
+                               trends.bodyFat.change < -0.5 ? 'decreasing' : 'stable';
+  }
+  
+  return trends;
+};
+
+const extractCircumferenceHistory = (measurements) => {
+  const history = {};
+  const parts = ['neck', 'shoulders', 'chest', 'upperArm', 'lowerArm', 'waist', 'hips', 'upperThigh', 'calf'];
+  
+  parts.forEach(part => {
+    history[part] = measurements
+      .filter(m => m.circumference[part])
+      .map(m => ({
+        date: m.date,
+        value: m.circumference[part]
+      }));
+  });
+  
+  return history;
+};
+
+const extractCaliperHistory = (measurements) => {
+  const history = {};
+  const sites = ['chest', 'abdominal', 'thigh', 'bicep', 'tricep', 'subscapular', 'suprailiac'];
+  
+  sites.forEach(site => {
+    history[site] = measurements
+      .filter(m => m.caliper[site])
+      .map(m => ({
+        date: m.date,
+        value: m.caliper[site]
+      }));
+  });
+  
+  return history;
+};
+
+const getWeekNumber = (date) => {
+  const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+  const dayNum = d.getUTCDay() || 7;
+  d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(),0,1));
+  return Math.ceil((((d - yearStart) / 86400000) + 1)/7);
+};
+
+const generateRecommendations = (progress, measurements, workouts, nutrition) => {
+  const recommendations = [];
+  
+  // Workout recommendations
+  if (workouts.completionRate < 70) {
+    recommendations.push({
+      category: 'Workouts',
+      priority: 'high',
+      message: 'Workout completion rate is below 70%. Consider adjusting workout difficulty or schedule.'
+    });
+  }
+  
+  // Nutrition recommendations
+  if (nutrition.averages.protein && nutrition.targets.protein) {
+    const proteinCompliance = (nutrition.averages.protein / nutrition.targets.protein) * 100;
+    if (proteinCompliance < 80) {
+      recommendations.push({
+        category: 'Nutrition',
+        priority: 'medium',
+        message: 'Protein intake is below target. Consider adding protein-rich foods or supplements.'
+      });
+    }
+  }
+  
+  // Progress recommendations
+  if (progress.goals.completionRate < 50) {
+    recommendations.push({
+      category: 'Goals',
+      priority: 'medium',
+      message: 'Goal completion rate is low. Review and adjust goals to be more achievable.'
+    });
+  }
+  
+  return recommendations;
+};
+
+// PDF content helpers
+const addProgressContent = (doc, data) => {
+  doc.fontSize(16).text('Progress Summary', { underline: true });
+  doc.fontSize(12);
+  doc.moveDown();
+  
+  data.summary.forEach(item => {
+    doc.text(`• ${item}`);
+  });
+  
+  doc.moveDown();
+  doc.text('Weight Progress:');
+  doc.text(`  Starting: ${data.progress.weight.start} kg`);
+  doc.text(`  Current: ${data.progress.weight.end} kg`);
+  doc.text(`  Change: ${data.progress.weight.change > 0 ? '+' : ''}${data.progress.weight.change.toFixed(1)} kg`);
+  
+  if (data.progress.bodyFat.start && data.progress.bodyFat.end) {
+    doc.moveDown();
+    doc.text('Body Fat Progress:');
+    doc.text(`  Starting: ${data.progress.bodyFat.start}%`);
+    doc.text(`  Current: ${data.progress.bodyFat.end}%`);
+    doc.text(`  Change: ${data.progress.bodyFat.change > 0 ? '+' : ''}${data.progress.bodyFat.change.toFixed(1)}%`);
+  }
+};
+
+const addMeasurementsContent = (doc, data) => {
+  doc.fontSize(16).text('Measurement History', { underline: true });
+  doc.fontSize(12);
+  doc.moveDown();
+  
+  // Add measurement table
+  data.measurements.forEach(measurement => {
+    doc.text(`Date: ${new Date(measurement.date).toLocaleDateString()}`);
+    if (measurement.weight) doc.text(`  Weight: ${measurement.weight} kg`);
+    if (measurement.body_fat) doc.text(`  Body Fat: ${measurement.body_fat}%`);
+    if (measurement.bmr) doc.text(`  BMR: ${measurement.bmr} kcal`);
+    doc.moveDown(0.5);
+  });
+};
+
+const addWorkoutsContent = (doc, data) => {
+  doc.fontSize(16).text('Workout Statistics', { underline: true });
+  doc.fontSize(12);
+  doc.moveDown();
+  
+  doc.text(`Total Workouts: ${data.statistics.total}`);
+  doc.text(`Completed: ${data.statistics.completed}`);
+  doc.text(`Completion Rate: ${data.completionRate}%`);
+  doc.text(`Total Duration: ${data.statistics.totalDuration} minutes`);
+  doc.text(`Total Calories: ${data.statistics.totalCalories}`);
+  if (data.statistics.avgMood > 0) {
+    doc.text(`Average Mood: ${data.statistics.avgMood}/5`);
+  }
+  
+  doc.moveDown();
+  doc.text('Top Exercises:');
+  data.topExercises.forEach((exercise, index) => {
+    doc.text(`  ${index + 1}. ${exercise.name} (${exercise.count} times)`);
+  });
+};
+
+const addNutritionContent = (doc, data) => {
+  doc.fontSize(16).text('Nutrition Summary', { underline: true });
+  doc.fontSize(12);
+  doc.moveDown();
+  
+  if (!data.nutritionPlan) {
+    doc.text('No nutrition plan found.');
+    return;
+  }
+  
+  doc.text('Average Daily Intake:');
+  doc.text(`  Protein: ${data.averages.protein}g (Target: ${data.targets.protein}g)`);
+  doc.text(`  Carbs: ${data.averages.carbs}g (Target: ${data.targets.carbs}g)`);
+  doc.text(`  Fat: ${data.averages.fat}g (Target: ${data.targets.fat}g)`);
+  doc.text(`  Calories: ${data.averages.calories} (Target: ${data.targets.calories})`);
+  doc.text(`  Fiber: ${data.averages.fiber}g (Target: ${data.targets.fiber}g)`);
+  doc.text(`  Water: ${data.averages.water}ml (Target: ${data.targets.water}ml)`);
+};
+
+const addComprehensiveContent = (doc, data) => {
+  // Add sections from each report type
+  addProgressContent(doc, data.progress);
+  doc.addPage();
+  addMeasurementsContent(doc, data.measurements);
+  doc.addPage();
+  addWorkoutsContent(doc, data.workouts);
+  doc.addPage();
+  addNutritionContent(doc, data.nutrition);
+  
+  // Add recommendations
+  doc.addPage();
+  doc.fontSize(16).text('Recommendations', { underline: true });
+  doc.fontSize(12);
+  doc.moveDown();
+  
+  data.recommendations.forEach(rec => {
+    doc.text(`[${rec.priority.toUpperCase()}] ${rec.category}: ${rec.message}`);
+    doc.moveDown(0.5);
+  });
+};
+
+// Excel worksheet helpers
+const addProgressWorksheets = (workbook, data) => {
+  const sheet = workbook.addWorksheet('Progress');
+  
+  sheet.columns = [
+    { header: 'Metric', key: 'metric', width: 20 },
+    { header: 'Start', key: 'start', width: 15 },
+    { header: 'End', key: 'end', width: 15 },
+    { header: 'Change', key: 'change', width: 15 },
+    { header: 'Change %', key: 'changePercent', width: 15 }
+  ];
+  
+  const rows = [
+    {
+      metric: 'Weight (kg)',
+      start: data.progress.weight.start,
+      end: data.progress.weight.end,
+      change: data.progress.weight.change,
+      changePercent: data.progress.weight.start > 0 
+        ? ((data.progress.weight.change / data.progress.weight.start) * 100).toFixed(1) + '%'
+        : 'N/A'
+    }
+  ];
+  
+  if (data.progress.bodyFat.start && data.progress.bodyFat.end) {
+    rows.push({
+      metric: 'Body Fat (%)',
+      start: data.progress.bodyFat.start,
+      end: data.progress.bodyFat.end,
+      change: data.progress.bodyFat.change,
+      changePercent: 'N/A'
+    });
+  }
+  
+  rows.push({
+    metric: 'Workouts',
+    start: data.progress.workouts.total,
+    end: data.progress.workouts.completed,
+    change: data.progress.workouts.completionRate + '%',
+    changePercent: 'N/A'
+  });
+  
+  sheet.addRows(rows);
+};
+
+const addMeasurementsWorksheets = (workbook, data) => {
+  const sheet = workbook.addWorksheet('Measurements');
+  
+  sheet.columns = [
+    { header: 'Date', key: 'date', width: 15 },
+    { header: 'Weight', key: 'weight', width: 10 },
+    { header: 'Body Fat %', key: 'bodyFat', width: 12 },
+    { header: 'BMR', key: 'bmr', width: 10 },
+    { header: 'Blood Pressure', key: 'bloodPressure', width: 15 }
+  ];
+  
+  const rows = data.measurements.map(m => ({
+    date: new Date(m.date).toLocaleDateString(),
+    weight: m.weight,
+    bodyFat: m.body_fat,
+    bmr: m.bmr,
+    bloodPressure: m.blood_pressure
+  }));
+  
+  sheet.addRows(rows);
+};
+
+const addWorkoutsWorksheets = (workbook, data) => {
+  const sheet = workbook.addWorksheet('Workouts');
+  
+  sheet.columns = [
+    { header: 'Date', key: 'date', width: 15 },
+    { header: 'Name', key: 'name', width: 30 },
+    { header: 'Completed', key: 'completed', width: 12 },
+    { header: 'Duration (min)', key: 'duration', width: 15 },
+    { header: 'Calories', key: 'calories', width: 12 },
+    { header: 'Mood', key: 'mood', width: 10 }
+  ];
+  
+  const rows = data.workouts.map(w => ({
+    date: new Date(w.scheduled_date || w.created_at).toLocaleDateString(),
+    name: w.name,
+    completed: w.completed ? 'Yes' : 'No',
+    duration: w.duration,
+    calories: w.calories_burned,
+    mood: w.mood_feedback
+  }));
+  
+  sheet.addRows(rows);
+};
+
+const addNutritionWorksheets = (workbook, data) => {
+  const sheet = workbook.addWorksheet('Nutrition');
+  
+  sheet.columns = [
+    { header: 'Date', key: 'date', width: 15 },
+    { header: 'Protein (g)', key: 'protein', width: 12 },
+    { header: 'Carbs (g)', key: 'carbs', width: 12 },
+    { header: 'Fat (g)', key: 'fat', width: 12 },
+    { header: 'Calories', key: 'calories', width: 12 },
+    { header: 'Fiber (g)', key: 'fiber', width: 12 },
+    { header: 'Water (ml)', key: 'water', width: 12 }
+  ];
+  
+  const rows = data.logs.map(log => ({
+    date: new Date(log.date).toLocaleDateString(),
+    protein: log.protein,
+    carbs: log.carbs,
+    fat: log.fat,
+    calories: log.calories,
+    fiber: log.fiber,
+    water: log.water
+  }));
+  
+  sheet.addRows(rows);
+};
+
+// Schedule report generation
+const scheduleReport = async (req, res) => {
+  try {
+    const { user } = req;
+    const { 
+      type,
+      clientId,
+      frequency, // daily, weekly, monthly
+      dayOfWeek, // for weekly
+      dayOfMonth, // for monthly
+      time,
+      format,
+      email
+    } = req.body;
+    
+    // Validate inputs
+    if (!type || !frequency || !format) {
+      return res.status(400).json({ error: 'Type, frequency, and format are required' });
+    }
+    
+    // Create scheduled report entry
+    const [scheduled] = await db('scheduled_reports')
+      .insert({
+        user_id: user.id,
+        client_id: clientId || user.id,
+        type,
+        frequency,
+        day_of_week: dayOfWeek,
+        day_of_month: dayOfMonth,
+        time: time || '08:00',
+        format,
+        email: email || user.email,
+        active: true
+      })
+      .returning('*');
+    
+    res.json({
+      scheduled,
+      message: 'Report scheduled successfully'
+    });
+  } catch (error) {
+    console.error('Schedule report error:', error);
+    res.status(500).json({ error: 'Failed to schedule report' });
+  }
+};
+
+// Get scheduled reports
+const getScheduledReports = async (req, res) => {
+  try {
+    const { user } = req;
+    
+    const scheduled = await db('scheduled_reports')
+      .where({ user_id: user.id })
+      .orderBy('created_at', 'desc');
+    
+    res.json(scheduled);
+  } catch (error) {
+    console.error('Get scheduled reports error:', error);
+    res.status(500).json({ error: 'Failed to fetch scheduled reports' });
+  }
+};
+
+// Cancel scheduled report
+const cancelScheduledReport = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { user } = req;
+    
+    const result = await db('scheduled_reports')
+      .where({ id, user_id: user.id })
+      .update({ active: false });
+    
+    if (result === 0) {
+      return res.status(404).json({ error: 'Scheduled report not found' });
+    }
+    
+    res.json({ message: 'Scheduled report cancelled' });
+  } catch (error) {
+    console.error('Cancel scheduled report error:', error);
+    res.status(500).json({ error: 'Failed to cancel scheduled report' });
+  }
+};
+
+// Create scheduled reports table if it doesn't exist
+const createScheduledReportsTable = `
+  CREATE TABLE IF NOT EXISTS scheduled_reports (
+    id SERIAL PRIMARY KEY,
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    client_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    type VARCHAR(50) NOT NULL,
+    frequency VARCHAR(20) NOT NULL,
+    day_of_week INTEGER,
+    day_of_month INTEGER,
+    time TIME NOT NULL,
+    format VARCHAR(10) NOT NULL,
+    email VARCHAR(255) NOT NULL,
+    active BOOLEAN DEFAULT true,
+    last_generated TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`;
+
+module.exports = {
+  generateReport,
+  scheduleReport,
+  getScheduledReports,
+  cancelScheduledReport
+};

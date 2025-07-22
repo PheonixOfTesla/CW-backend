@@ -1,0 +1,660 @@
+const router = require('express').Router();
+const goalController = require('../controllers/goalController');
+const { authenticate } = require('../middleware/auth');
+const { validateRequest, validateParams, validateQuery } = require('../middleware/validation');
+const { schemas } = require('../middleware/validation');
+const rateLimiter = require('../middleware/rateLimiter');
+const Joi = require('joi');
+
+// Goal-specific validation schemas
+const goalSchemas = {
+  createGoal: Joi.object({
+    clientId: schemas.uuid.when('$userRole', {
+      is: 'client',
+      then: Joi.optional(),
+      otherwise: Joi.required()
+    }),
+    name: Joi.string().min(2).max(200).required(),
+    target: Joi.number().required(),
+    current: Joi.number().default(0),
+    deadline: schemas.date.required(),
+    category: Joi.string().valid('weight', 'body-composition', 'performance', 'health', 'other').default('other'),
+    priority: Joi.string().valid('low', 'medium', 'high').default('medium'),
+    milestones: Joi.array().items(
+      Joi.object({
+        name: Joi.string().required(),
+        date: schemas.date.required(),
+        target: Joi.number().required(),
+        achieved: Joi.boolean().default(false)
+      })
+    ).optional()
+  }),
+  
+  updateGoal: Joi.object({
+    name: Joi.string().min(2).max(200).optional(),
+    target: Joi.number().optional(),
+    current: Joi.number().optional(),
+    deadline: schemas.date.optional(),
+    category: Joi.string().valid('weight', 'body-composition', 'performance', 'health', 'other').optional(),
+    priority: Joi.string().valid('low', 'medium', 'high').optional(),
+    milestones: Joi.array().items(
+      Joi.object({
+        name: Joi.string().required(),
+        date: schemas.date.required(),
+        target: Joi.number().required(),
+        achieved: Joi.boolean().optional(),
+        achievedDate: schemas.date.optional()
+      })
+    ).optional(),
+    progressNotes: Joi.string().max(500).optional()
+  }),
+  
+  updateProgress: Joi.object({
+    value: Joi.number().required(),
+    notes: Joi.string().max(500).optional()
+  }),
+  
+  updateMilestone: Joi.object({
+    achieved: Joi.boolean().required(),
+    achievedDate: schemas.date.when('achieved', {
+      is: true,
+      then: Joi.required(),
+      otherwise: Joi.optional()
+    })
+  }),
+  
+  goalFilters: Joi.object({
+    clientId: schemas.uuid.optional(),
+    category: Joi.string().valid('weight', 'body-composition', 'performance', 'health', 'other').optional(),
+    priority: Joi.string().valid('low', 'medium', 'high').optional(),
+    completed: Joi.boolean().optional(),
+    page: Joi.number().integer().min(1).default(1),
+    limit: Joi.number().integer().min(1).max(100).default(20),
+    sortBy: Joi.string().valid('deadline', 'created_at', 'priority', 'progress').default('deadline'),
+    sortOrder: Joi.string().valid('asc', 'desc').default('asc')
+  }),
+  
+  goalStats: Joi.object({
+    clientId: schemas.uuid.optional(),
+    startDate: schemas.date.optional(),
+    endDate: schemas.date.optional()
+  })
+};
+
+// Apply rate limiting
+router.use(rateLimiter.general);
+
+// Goal CRUD operations
+
+// Get all goals (with filters)
+router.get(
+  '/',
+  authenticate,
+  validateQuery(goalSchemas.goalFilters),
+  goalController.getGoals
+);
+
+// Get single goal
+router.get(
+  '/:id',
+  authenticate,
+  validateParams(schemas.idParam),
+  goalController.getGoal
+);
+
+// Create new goal
+router.post(
+  '/',
+  authenticate,
+  validateRequest(goalSchemas.createGoal),
+  goalController.createGoal
+);
+
+// Update goal
+router.put(
+  '/:id',
+  authenticate,
+  validateParams(schemas.idParam),
+  validateRequest(goalSchemas.updateGoal),
+  goalController.updateGoal
+);
+
+// Delete goal
+router.delete(
+  '/:id',
+  authenticate,
+  validateParams(schemas.idParam),
+  goalController.deleteGoal
+);
+
+// Progress tracking
+
+// Update goal progress (client only)
+router.post(
+  '/:id/progress',
+  authenticate,
+  validateParams(schemas.idParam),
+  validateRequest(goalSchemas.updateProgress),
+  goalController.updateProgress
+);
+
+// Update milestone status
+router.put(
+  '/:id/milestones/:milestoneIndex',
+  authenticate,
+  validateParams(Joi.object({
+    id: Joi.alternatives().try(
+      Joi.string().uuid({ version: 'uuidv4' }),
+      Joi.number().integer().positive()
+    ),
+    milestoneIndex: Joi.number().integer().min(0).required()
+  })),
+  validateRequest(goalSchemas.updateMilestone),
+  goalController.updateMilestone
+);
+
+// Analytics and statistics
+
+// Get goal statistics
+router.get(
+  '/stats/overview',
+  authenticate,
+  validateQuery(goalSchemas.goalStats),
+  goalController.getGoalStats
+);
+
+// Get goal progress timeline
+router.get(
+  '/:id/timeline',
+  authenticate,
+  validateParams(schemas.idParam),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { user } = req;
+      
+      // Get goal to check permissions
+      const goal = await db('goals').where({ id }).first();
+      if (!goal) {
+        return res.status(404).json({ error: 'Goal not found' });
+      }
+      
+      // Check authorization
+      const userRoles = JSON.parse(user.roles);
+      if (userRoles.includes('client') && goal.client_id !== user.id) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+      
+      // Get progress history
+      const timeline = await db('goal_progress')
+        .where({ goal_id: id })
+        .orderBy('date', 'asc');
+      
+      // Get milestones
+      const milestones = JSON.parse(goal.milestones || '[]');
+      
+      // Combine into timeline
+      const events = [
+        {
+          type: 'created',
+          date: goal.created_at,
+          value: 0,
+          notes: 'Goal created'
+        },
+        ...timeline.map(p => ({
+          type: 'progress',
+          date: p.date,
+          value: p.value,
+          notes: p.notes
+        })),
+        ...milestones.filter(m => m.achieved).map(m => ({
+          type: 'milestone',
+          date: m.achievedDate,
+          name: m.name,
+          target: m.target
+        }))
+      ].sort((a, b) => new Date(a.date) - new Date(b.date));
+      
+      res.json({
+        goalId: id,
+        goalName: goal.name,
+        timeline: events
+      });
+    } catch (error) {
+      console.error('Get goal timeline error:', error);
+      res.status(500).json({ error: 'Failed to fetch goal timeline' });
+    }
+  }
+);
+
+// Goal templates
+
+// Get goal templates
+router.get(
+  '/templates/list',
+  authenticate,
+  validateQuery(Joi.object({
+    category: Joi.string().valid('weight', 'body-composition', 'performance', 'health', 'other').optional(),
+    page: Joi.number().integer().min(1).default(1),
+    limit: Joi.number().integer().min(1).max(50).default(20)
+  })),
+  async (req, res) => {
+    try {
+      const { category, page = 1, limit = 20 } = req.query;
+      
+      // Predefined goal templates
+      const templates = [
+        // Weight goals
+        {
+          id: 'weight-loss-10',
+          name: 'Lose 10 pounds',
+          category: 'weight',
+          target: -10,
+          duration: 90, // days
+          milestones: [
+            { name: '25% Progress', percentage: 25 },
+            { name: 'Halfway There!', percentage: 50 },
+            { name: '75% Complete', percentage: 75 }
+          ]
+        },
+        {
+          id: 'weight-gain-10',
+          name: 'Gain 10 pounds',
+          category: 'weight',
+          target: 10,
+          duration: 120,
+          milestones: [
+            { name: 'First 3 pounds', percentage: 30 },
+            { name: '5 pounds gained', percentage: 50 },
+            { name: 'Almost there!', percentage: 80 }
+          ]
+        },
+        
+        // Body composition goals
+        {
+          id: 'body-fat-5',
+          name: 'Reduce body fat by 5%',
+          category: 'body-composition',
+          target: -5,
+          duration: 90,
+          milestones: [
+            { name: '1% down', percentage: 20 },
+            { name: '2.5% down', percentage: 50 },
+            { name: '4% down', percentage: 80 }
+          ]
+        },
+        
+        // Performance goals
+        {
+          id: 'run-5k',
+          name: 'Run 5K without stopping',
+          category: 'performance',
+          target: 5000, // meters
+          duration: 60,
+          milestones: [
+            { name: 'Run 1K', percentage: 20 },
+            { name: 'Run 2.5K', percentage: 50 },
+            { name: 'Run 4K', percentage: 80 }
+          ]
+        },
+        {
+          id: 'bench-bodyweight',
+          name: 'Bench press bodyweight',
+          category: 'performance',
+          target: 1, // multiplier
+          duration: 180,
+          milestones: [
+            { name: '60% bodyweight', percentage: 60 },
+            { name: '80% bodyweight', percentage: 80 },
+            { name: '90% bodyweight', percentage: 90 }
+          ]
+        },
+        
+        // Health goals
+        {
+          id: 'blood-pressure',
+          name: 'Lower blood pressure to healthy range',
+          category: 'health',
+          target: 120, // systolic
+          duration: 90,
+          milestones: [
+            { name: '5 point reduction', percentage: 33 },
+            { name: '10 point reduction', percentage: 66 },
+            { name: 'Reach target', percentage: 100 }
+          ]
+        },
+        {
+          id: 'water-intake',
+          name: 'Drink 3L water daily for 30 days',
+          category: 'health',
+          target: 30, // days
+          duration: 30,
+          milestones: [
+            { name: 'One week complete', percentage: 23 },
+            { name: 'Two weeks strong', percentage: 47 },
+            { name: 'Three weeks done', percentage: 70 }
+          ]
+        }
+      ];
+      
+      // Filter by category
+      const filtered = category 
+        ? templates.filter(t => t.category === category)
+        : templates;
+      
+      // Paginate
+      const start = (page - 1) * limit;
+      const paginated = filtered.slice(start, start + limit);
+      
+      res.json({
+        templates: paginated,
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(limit),
+          total: filtered.length,
+          pages: Math.ceil(filtered.length / limit)
+        }
+      });
+    } catch (error) {
+      console.error('Get goal templates error:', error);
+      res.status(500).json({ error: 'Failed to fetch goal templates' });
+    }
+  }
+);
+
+// Create goal from template
+router.post(
+  '/templates/apply',
+  authenticate,
+  validateRequest(Joi.object({
+    templateId: Joi.string().required(),
+    clientId: schemas.uuid.optional(),
+    customizations: Joi.object({
+      name: Joi.string().optional(),
+      target: Joi.number().optional(),
+      deadline: schemas.date.optional(),
+      current: Joi.number().optional()
+    }).optional()
+  })),
+  async (req, res) => {
+    try {
+      const { templateId, clientId, customizations = {} } = req.body;
+      const { user } = req;
+      
+      // Get template (in production, this would be from database)
+      const templates = {
+        'weight-loss-10': {
+          name: 'Lose 10 pounds',
+          category: 'weight',
+          target: -10,
+          duration: 90,
+          priority: 'medium'
+        },
+        'body-fat-5': {
+          name: 'Reduce body fat by 5%',
+          category: 'body-composition',
+          target: -5,
+          duration: 90,
+          priority: 'high'
+        }
+        // ... other templates
+      };
+      
+      const template = templates[templateId];
+      if (!template) {
+        return res.status(404).json({ error: 'Template not found' });
+      }
+      
+      // Calculate deadline if not provided
+      const deadline = customizations.deadline || 
+        new Date(Date.now() + template.duration * 24 * 60 * 60 * 1000);
+      
+      // Create goal from template
+      const goalData = {
+        clientId: clientId || user.id,
+        name: customizations.name || template.name,
+        target: customizations.target || template.target,
+        current: customizations.current || 0,
+        deadline,
+        category: template.category,
+        priority: template.priority,
+        milestones: [] // Would calculate based on template
+      };
+      
+      req.body = goalData;
+      return goalController.createGoal(req, res);
+    } catch (error) {
+      console.error('Apply goal template error:', error);
+      res.status(500).json({ error: 'Failed to apply template' });
+    }
+  }
+);
+
+// Bulk operations
+
+// Bulk update goals
+router.put(
+  '/bulk/update',
+  authenticate,
+  validateRequest(Joi.object({
+    goalIds: Joi.array().items(Joi.number().integer().positive()).min(1).required(),
+    updates: Joi.object({
+      priority: Joi.string().valid('low', 'medium', 'high').optional(),
+      category: Joi.string().valid('weight', 'body-composition', 'performance', 'health', 'other').optional()
+    }).min(1).required()
+  })),
+  async (req, res) => {
+    try {
+      const { goalIds, updates } = req.body;
+      const { user } = req;
+      
+      // Verify user has access to all goals
+      const goals = await db('goals').whereIn('id', goalIds);
+      
+      const userRoles = JSON.parse(user.roles);
+      for (const goal of goals) {
+        if (userRoles.includes('client') && goal.client_id !== user.id) {
+          return res.status(403).json({ error: 'Access denied to one or more goals' });
+        }
+        
+        if (userRoles.includes('specialist') && !userRoles.includes('admin')) {
+          const clientIds = JSON.parse(user.client_ids || '[]');
+          if (!clientIds.includes(goal.client_id)) {
+            return res.status(403).json({ error: 'Access denied to one or more goals' });
+          }
+        }
+      }
+      
+      // Update goals
+      const updated = await db('goals')
+        .whereIn('id', goalIds)
+        .update({
+          ...updates,
+          updated_at: new Date()
+        });
+      
+      res.json({
+        message: `${updated} goals updated successfully`,
+        updatedCount: updated
+      });
+    } catch (error) {
+      console.error('Bulk update goals error:', error);
+      res.status(500).json({ error: 'Failed to bulk update goals' });
+    }
+  }
+);
+
+// Goal recommendations
+
+// Get goal recommendations based on client data
+router.get(
+  '/recommendations',
+  authenticate,
+  validateQuery(Joi.object({
+    clientId: schemas.uuid.optional()
+  })),
+  async (req, res) => {
+    try {
+      const { user } = req;
+      const { clientId } = req.query;
+      
+      // Determine target client
+      const targetClientId = clientId || user.id;
+      
+      // Get client's current goals and measurements
+      const [activeGoals, latestMeasurement, completedGoals] = await Promise.all([
+        db('goals')
+          .where({ client_id: targetClientId, completed: false })
+          .count('* as count')
+          .first(),
+        db('measurements')
+          .where({ client_id: targetClientId })
+          .orderBy('date', 'desc')
+          .first(),
+        db('goals')
+          .where({ client_id: targetClientId, completed: true })
+          .orderBy('completed_date', 'desc')
+          .limit(5)
+      ]);
+      
+      const recommendations = [];
+      
+      // Recommend based on active goals count
+      if (activeGoals.count < 3) {
+        recommendations.push({
+          type: 'goal_count',
+          priority: 'medium',
+          message: 'You have fewer than 3 active goals. Consider adding more to stay motivated!',
+          suggestedGoals: ['performance', 'health']
+        });
+      }
+      
+      // Recommend based on measurements
+      if (latestMeasurement) {
+        if (latestMeasurement.body_fat > 25) {
+          recommendations.push({
+            type: 'body_composition',
+            priority: 'high',
+            message: 'Consider setting a body fat reduction goal for better health',
+            suggestedTarget: -5,
+            category: 'body-composition'
+          });
+        }
+        
+        if (latestMeasurement.weight && !completedGoals.some(g => g.category === 'weight')) {
+          recommendations.push({
+            type: 'weight',
+            priority: 'medium',
+            message: 'You haven\'t set any weight-related goals yet',
+            category: 'weight'
+          });
+        }
+      }
+      
+      // Recommend based on completed goals patterns
+      const completedCategories = completedGoals.map(g => g.category);
+      const missingCategories = ['performance', 'health', 'body-composition', 'weight']
+        .filter(cat => !completedCategories.includes(cat));
+      
+      if (missingCategories.length > 0) {
+        recommendations.push({
+          type: 'diversity',
+          priority: 'low',
+          message: 'Try setting goals in new categories for well-rounded progress',
+          suggestedCategories: missingCategories
+        });
+      }
+      
+      res.json({ recommendations });
+    } catch (error) {
+      console.error('Get goal recommendations error:', error);
+      res.status(500).json({ error: 'Failed to get recommendations' });
+    }
+  }
+);
+
+// Export goals data
+router.get(
+  '/export',
+  authenticate,
+  validateQuery(Joi.object({
+    clientId: schemas.uuid.optional(),
+    includeCompleted: Joi.boolean().default(true),
+    format: Joi.string().valid('json', 'csv').default('json')
+  })),
+  rateLimiter.strict,
+  async (req, res) => {
+    try {
+      const { user } = req;
+      const { clientId, includeCompleted, format } = req.query;
+      
+      // Determine target client
+      let targetClientId;
+      const userRoles = JSON.parse(user.roles);
+      
+      if (userRoles.includes('client')) {
+        targetClientId = user.id;
+      } else if (clientId) {
+        targetClientId = clientId;
+      } else {
+        return res.status(400).json({ error: 'Client ID required' });
+      }
+      
+      // Get goals
+      let query = db('goals').where({ client_id: targetClientId });
+      if (!includeCompleted) {
+        query = query.where({ completed: false });
+      }
+      
+      const goals = await query.orderBy('created_at', 'desc');
+      
+      // Get progress for each goal
+      const goalsWithProgress = await Promise.all(goals.map(async goal => {
+        const progress = await db('goal_progress')
+          .where({ goal_id: goal.id })
+          .orderBy('date', 'asc');
+        
+        return {
+          ...goal,
+          milestones: JSON.parse(goal.milestones || '[]'),
+          progressHistory: progress
+        };
+      }));
+      
+      if (format === 'csv') {
+        // Generate CSV
+        const csv = [
+          'Name,Category,Priority,Target,Current,Progress %,Deadline,Status,Created',
+          ...goalsWithProgress.map(goal => {
+            const progress = goal.target !== 0 ? Math.round((goal.current / goal.target) * 100) : 0;
+            const status = goal.completed ? 'Completed' : 
+                          new Date(goal.deadline) < new Date() ? 'Overdue' : 'Active';
+            
+            return `"${goal.name}",${goal.category},${goal.priority},${goal.target},${goal.current},${progress}%,${goal.deadline},${status},${goal.created_at}`;
+          })
+        ].join('\n');
+        
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', 'attachment; filename="goals-export.csv"');
+        res.send(csv);
+      } else {
+        // JSON format
+        res.json({
+          goals: goalsWithProgress,
+          summary: {
+            total: goals.length,
+            active: goals.filter(g => !g.completed).length,
+            completed: goals.filter(g => g.completed).length,
+            categories: [...new Set(goals.map(g => g.category))]
+          },
+          exportDate: new Date()
+        });
+      }
+    } catch (error) {
+      console.error('Export goals error:', error);
+      res.status(500).json({ error: 'Failed to export goals' });
+    }
+  }
+);
+
+module.exports = router;

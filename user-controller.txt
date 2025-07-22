@@ -1,0 +1,956 @@
+const { db } = require('../config/database');
+const bcrypt = require('bcrypt');
+const fileService = require('../services/fileService');
+
+// Get all users with pagination and filtering
+const getUsers = async (req, res) => {
+  try {
+    const { user } = req;
+    const { 
+      role, 
+      search, 
+      status,
+      page = 1, 
+      limit = 20,
+      sortBy = 'created_at',
+      sortOrder = 'desc' 
+    } = req.query;
+    
+    // Check authorization - only admins and owners can view all users
+    const userRoles = JSON.parse(user.roles);
+    if (!userRoles.includes('admin') && !userRoles.includes('owner')) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    
+    let query = db('users').select(
+      'id',
+      'email',
+      'name',
+      'phone',
+      'roles',
+      'subscription_plan',
+      'billing_enabled',
+      'can_train_clients',
+      'two_factor_enabled',
+      'profile_picture_url',
+      'is_online',
+      'last_seen',
+      'created_at',
+      'updated_at'
+    );
+    
+    // Apply filters
+    if (role) {
+      query = query.whereRaw('roles::jsonb @> ?', [JSON.stringify([role])]);
+    }
+    
+    if (search) {
+      query = query.where(function() {
+        this.where('name', 'ilike', `%${search}%`)
+          .orWhere('email', 'ilike', `%${search}%`)
+          .orWhere('phone', 'ilike', `%${search}%`);
+      });
+    }
+    
+    if (status === 'online') {
+      query = query.where('is_online', true);
+    } else if (status === 'offline') {
+      query = query.where('is_online', false);
+    }
+    
+    // Get total count for pagination
+    const countQuery = query.clone();
+    const [{ count }] = await countQuery.count('* as count');
+    
+    // Apply pagination
+    const offset = (page - 1) * limit;
+    const users = await query
+      .orderBy(sortBy, sortOrder)
+      .limit(limit)
+      .offset(offset);
+    
+    // Parse JSON fields and calculate additional metrics
+    const formattedUsers = await Promise.all(users.map(async user => {
+      const roles = JSON.parse(user.roles);
+      const clientIds = JSON.parse(user.client_ids || '[]');
+      const specialistIds = JSON.parse(user.specialist_ids || '[]');
+      
+      // Get additional metrics based on role
+      let metrics = {};
+      if (roles.includes('client')) {
+        const [workoutCount] = await db('workouts')
+          .where('client_id', user.id)
+          .count('* as count');
+        
+        const [goalCount] = await db('goals')
+          .where('client_id', user.id)
+          .where('completed', false)
+          .count('* as count');
+        
+        metrics = {
+          totalWorkouts: parseInt(workoutCount.count),
+          activeGoals: parseInt(goalCount.count)
+        };
+      } else if (roles.includes('specialist')) {
+        metrics = {
+          activeClients: clientIds.length,
+          totalClients: clientIds.length
+        };
+      }
+      
+      return {
+        ...user,
+        roles,
+        clientIds,
+        specialistIds,
+        metrics
+      };
+    }));
+    
+    res.json({
+      users: formattedUsers,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: parseInt(count),
+        pages: Math.ceil(count / limit)
+      }
+    });
+  } catch (error) {
+    console.error('Get users error:', error);
+    res.status(500).json({ error: 'Failed to fetch users' });
+  }
+};
+
+// Get single user by ID
+const getUser = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { user: currentUser } = req;
+    
+    // Check authorization
+    const currentUserRoles = JSON.parse(currentUser.roles);
+    const canViewAnyUser = currentUserRoles.includes('admin') || currentUserRoles.includes('owner');
+    
+    if (!canViewAnyUser && currentUser.id !== id) {
+      // Check if specialist viewing their client
+      const clientIds = JSON.parse(currentUser.client_ids || '[]');
+      if (!clientIds.includes(id)) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+    }
+    
+    const user = await db('users')
+      .select(
+        'id',
+        'email',
+        'name',
+        'phone',
+        'address',
+        'roles',
+        'subscription_plan',
+        'billing_enabled',
+        'can_train_clients',
+        'can_assign_billing',
+        'two_factor_enabled',
+        'profile_picture_url',
+        'is_online',
+        'last_seen',
+        'specialization',
+        'client_ids',
+        'specialist_ids',
+        'created_at',
+        'updated_at'
+      )
+      .where({ id })
+      .first();
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    // Parse JSON fields
+    const formattedUser = {
+      ...user,
+      roles: JSON.parse(user.roles),
+      specialization: user.specialization ? JSON.parse(user.specialization) : null,
+      clientIds: JSON.parse(user.client_ids || '[]'),
+      specialistIds: JSON.parse(user.specialist_ids || '[]')
+    };
+    
+    // Get related data based on role
+    const roles = formattedUser.roles;
+    
+    if (roles.includes('client')) {
+      // Get latest measurement
+      const latestMeasurement = await db('measurements')
+        .where({ client_id: id })
+        .orderBy('date', 'desc')
+        .first();
+      
+      // Get active goals count
+      const [{ activeGoals }] = await db('goals')
+        .where({ client_id: id, completed: false })
+        .count('* as activeGoals');
+      
+      // Get completed workouts this month
+      const startOfMonth = new Date();
+      startOfMonth.setDate(1);
+      startOfMonth.setHours(0, 0, 0, 0);
+      
+      const [{ workoutsThisMonth }] = await db('workouts')
+        .where({ client_id: id, completed: true })
+        .where('completed_date', '>=', startOfMonth)
+        .count('* as workoutsThisMonth');
+      
+      formattedUser.clientMetrics = {
+        latestMeasurement,
+        activeGoals: parseInt(activeGoals),
+        workoutsThisMonth: parseInt(workoutsThisMonth)
+      };
+    }
+    
+    if (roles.includes('specialist')) {
+      // Get client list with basic info
+      const clients = await db('users')
+        .select('id', 'name', 'email', 'profile_picture_url', 'is_online')
+        .whereIn('id', formattedUser.clientIds);
+      
+      formattedUser.clients = clients;
+    }
+    
+    res.json(formattedUser);
+  } catch (error) {
+    console.error('Get user error:', error);
+    res.status(500).json({ error: 'Failed to fetch user' });
+  }
+};
+
+// Update user
+const updateUser = async (req, res) => {
+  const trx = await db.transaction();
+  
+  try {
+    const { id } = req.params;
+    const { user: currentUser } = req;
+    const updateData = req.body;
+    
+    // Check authorization
+    const currentUserRoles = JSON.parse(currentUser.roles);
+    const isAdmin = currentUserRoles.includes('admin') || currentUserRoles.includes('owner');
+    
+    if (!isAdmin && currentUser.id !== id) {
+      await trx.rollback();
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    
+    // Check if user exists
+    const existingUser = await trx('users').where({ id }).first();
+    if (!existingUser) {
+      await trx.rollback();
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    // Prepare update object
+    const updates = {};
+    
+    // Basic fields anyone can update on their own profile
+    if (updateData.name !== undefined) updates.name = updateData.name;
+    if (updateData.phone !== undefined) updates.phone = updateData.phone;
+    if (updateData.address !== undefined) updates.address = updateData.address;
+    if (updateData.specialization !== undefined) updates.specialization = JSON.stringify(updateData.specialization);
+    
+    // Admin-only fields
+    if (isAdmin) {
+      if (updateData.email !== undefined) {
+        // Check if email already exists
+        const emailExists = await trx('users')
+          .where({ email: updateData.email })
+          .whereNot({ id })
+          .first();
+        
+        if (emailExists) {
+          await trx.rollback();
+          return res.status(409).json({ error: 'Email already in use' });
+        }
+        updates.email = updateData.email.toLowerCase();
+      }
+      
+      if (updateData.roles !== undefined) updates.roles = JSON.stringify(updateData.roles);
+      if (updateData.subscriptionPlan !== undefined) updates.subscription_plan = updateData.subscriptionPlan;
+      if (updateData.billingEnabled !== undefined) updates.billing_enabled = updateData.billingEnabled;
+      if (updateData.canTrainClients !== undefined) updates.can_train_clients = updateData.canTrainClients;
+      if (updateData.canAssignBilling !== undefined) updates.can_assign_billing = updateData.canAssignBilling;
+      if (updateData.clientIds !== undefined) updates.client_ids = JSON.stringify(updateData.clientIds);
+      if (updateData.specialistIds !== undefined) updates.specialist_ids = JSON.stringify(updateData.specialistIds);
+    }
+    
+    // Update password if provided
+    if (updateData.password) {
+      // Verify current password if not admin updating another user
+      if (!isAdmin || currentUser.id === id) {
+        if (!updateData.currentPassword) {
+          await trx.rollback();
+          return res.status(400).json({ error: 'Current password required' });
+        }
+        
+        const isValidPassword = await bcrypt.compare(updateData.currentPassword, existingUser.password);
+        if (!isValidPassword) {
+          await trx.rollback();
+          return res.status(401).json({ error: 'Current password is incorrect' });
+        }
+      }
+      
+      updates.password = await bcrypt.hash(updateData.password, 10);
+    }
+    
+    // Only update if there are changes
+    if (Object.keys(updates).length === 0) {
+      await trx.rollback();
+      return res.status(400).json({ error: 'No valid updates provided' });
+    }
+    
+    updates.updated_at = new Date();
+    
+    // Perform update
+    const [updatedUser] = await trx('users')
+      .where({ id })
+      .update(updates)
+      .returning([
+        'id',
+        'email',
+        'name',
+        'phone',
+        'address',
+        'roles',
+        'subscription_plan',
+        'billing_enabled',
+        'can_train_clients',
+        'can_assign_billing',
+        'two_factor_enabled',
+        'profile_picture_url',
+        'specialization',
+        'client_ids',
+        'specialist_ids',
+        'updated_at'
+      ]);
+    
+    // Log audit
+    await trx('audit_logs').insert({
+      user_id: currentUser.id,
+      action: 'update',
+      resource: 'user',
+      resource_id: id,
+      details: `Updated user profile${isAdmin && currentUser.id !== id ? ' (admin action)' : ''}`,
+      ip_address: req.ip,
+      user_agent: req.get('user-agent'),
+      metadata: JSON.stringify({ 
+        updatedFields: Object.keys(updates).filter(k => k !== 'password' && k !== 'updated_at')
+      })
+    });
+    
+    await trx.commit();
+    
+    // Format response
+    const formattedUser = {
+      ...updatedUser,
+      roles: JSON.parse(updatedUser.roles),
+      specialization: updatedUser.specialization ? JSON.parse(updatedUser.specialization) : null,
+      clientIds: JSON.parse(updatedUser.client_ids || '[]'),
+      specialistIds: JSON.parse(updatedUser.specialist_ids || '[]')
+    };
+    
+    // Don't send password in response
+    delete formattedUser.password;
+    
+    res.json({
+      user: formattedUser,
+      message: 'User updated successfully'
+    });
+  } catch (error) {
+    await trx.rollback();
+    console.error('Update user error:', error);
+    res.status(500).json({ error: 'Failed to update user' });
+  }
+};
+
+// Delete user
+const deleteUser = async (req, res) => {
+  const trx = await db.transaction();
+  
+  try {
+    const { id } = req.params;
+    const { user: currentUser } = req;
+    
+    // Check authorization - only admins and owners can delete users
+    const userRoles = JSON.parse(currentUser.roles);
+    if (!userRoles.includes('admin') && !userRoles.includes('owner')) {
+      await trx.rollback();
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    
+    // Prevent self-deletion
+    if (currentUser.id === id) {
+      await trx.rollback();
+      return res.status(400).json({ error: 'Cannot delete your own account' });
+    }
+    
+    // Check if user exists
+    const userToDelete = await trx('users').where({ id }).first();
+    if (!userToDelete) {
+      await trx.rollback();
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    // Check if user has active subscriptions
+    const activeSubscriptions = await trx('subscriptions')
+      .where({ client_id: id, status: 'active' })
+      .count('* as count')
+      .first();
+    
+    if (activeSubscriptions.count > 0) {
+      await trx.rollback();
+      return res.status(400).json({ 
+        error: 'Cannot delete user with active subscriptions. Cancel subscriptions first.' 
+      });
+    }
+    
+    // Delete profile picture if exists
+    if (userToDelete.profile_picture_url) {
+      try {
+        const key = userToDelete.profile_picture_url.split('/').slice(-2).join('/');
+        await fileService.deleteFile(key);
+      } catch (error) {
+        console.error('Failed to delete profile picture:', error);
+      }
+    }
+    
+    // Delete user (cascade will handle related records)
+    await trx('users').where({ id }).delete();
+    
+    // Log audit
+    await trx('audit_logs').insert({
+      user_id: currentUser.id,
+      action: 'delete',
+      resource: 'user',
+      resource_id: id,
+      details: `Deleted user: ${userToDelete.name} (${userToDelete.email})`,
+      ip_address: req.ip,
+      user_agent: req.get('user-agent'),
+      metadata: JSON.stringify({ 
+        deletedUserRoles: JSON.parse(userToDelete.roles)
+      })
+    });
+    
+    await trx.commit();
+    
+    res.json({ 
+      message: 'User deleted successfully',
+      deletedUser: {
+        id: userToDelete.id,
+        name: userToDelete.name,
+        email: userToDelete.email
+      }
+    });
+  } catch (error) {
+    await trx.rollback();
+    console.error('Delete user error:', error);
+    res.status(500).json({ error: 'Failed to delete user' });
+  }
+};
+
+// Assign clients to specialist
+const assignClients = async (req, res) => {
+  const trx = await db.transaction();
+  
+  try {
+    const { specialistId } = req.params;
+    const { clientIds, action = 'add' } = req.body;
+    const { user } = req;
+    
+    // Check authorization
+    const userRoles = JSON.parse(user.roles);
+    if (!userRoles.includes('admin') && !userRoles.includes('owner')) {
+      await trx.rollback();
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    
+    // Validate specialist exists and has correct role
+    const specialist = await trx('users').where({ id: specialistId }).first();
+    if (!specialist) {
+      await trx.rollback();
+      return res.status(404).json({ error: 'Specialist not found' });
+    }
+    
+    const specialistRoles = JSON.parse(specialist.roles);
+    if (!specialistRoles.includes('specialist')) {
+      await trx.rollback();
+      return res.status(400).json({ error: 'User is not a specialist' });
+    }
+    
+    // Validate all clients exist and have correct role
+    const clients = await trx('users').whereIn('id', clientIds);
+    if (clients.length !== clientIds.length) {
+      await trx.rollback();
+      return res.status(400).json({ error: 'One or more clients not found' });
+    }
+    
+    for (const client of clients) {
+      const clientRoles = JSON.parse(client.roles);
+      if (!clientRoles.includes('client')) {
+        await trx.rollback();
+        return res.status(400).json({ error: `User ${client.name} is not a client` });
+      }
+    }
+    
+    // Get current assignments
+    const currentSpecialistClients = JSON.parse(specialist.client_ids || '[]');
+    let updatedSpecialistClients;
+    
+    if (action === 'add') {
+      // Add new clients (avoid duplicates)
+      updatedSpecialistClients = [...new Set([...currentSpecialistClients, ...clientIds])];
+    } else if (action === 'remove') {
+      // Remove clients
+      updatedSpecialistClients = currentSpecialistClients.filter(id => !clientIds.includes(id));
+    } else {
+      await trx.rollback();
+      return res.status(400).json({ error: 'Invalid action. Use "add" or "remove"' });
+    }
+    
+    // Update specialist's client list
+    await trx('users')
+      .where({ id: specialistId })
+      .update({
+        client_ids: JSON.stringify(updatedSpecialistClients),
+        updated_at: new Date()
+      });
+    
+    // Update each client's specialist list
+    for (const clientId of clientIds) {
+      const client = clients.find(c => c.id === clientId);
+      const currentClientSpecialists = JSON.parse(client.specialist_ids || '[]');
+      
+      let updatedClientSpecialists;
+      if (action === 'add') {
+        updatedClientSpecialists = [...new Set([...currentClientSpecialists, specialistId])];
+      } else {
+        updatedClientSpecialists = currentClientSpecialists.filter(id => id !== specialistId);
+      }
+      
+      await trx('users')
+        .where({ id: clientId })
+        .update({
+          specialist_ids: JSON.stringify(updatedClientSpecialists),
+          updated_at: new Date()
+        });
+    }
+    
+    // Send notifications to affected users
+    const io = req.app.get('io');
+    const notificationMessage = action === 'add' 
+      ? `You have been assigned to ${specialist.name}`
+      : `You have been unassigned from ${specialist.name}`;
+    
+    for (const clientId of clientIds) {
+      io.to(clientId).emit('specialist-assignment', {
+        specialistId,
+        specialistName: specialist.name,
+        action,
+        message: notificationMessage
+      });
+    }
+    
+    // Log audit
+    await trx('audit_logs').insert({
+      user_id: user.id,
+      action: 'assign_clients',
+      resource: 'user',
+      resource_id: specialistId,
+      details: `${action === 'add' ? 'Assigned' : 'Unassigned'} ${clientIds.length} clients ${action === 'add' ? 'to' : 'from'} specialist`,
+      ip_address: req.ip,
+      user_agent: req.get('user-agent'),
+      metadata: JSON.stringify({ 
+        specialistId,
+        clientIds,
+        action
+      })
+    });
+    
+    await trx.commit();
+    
+    res.json({
+      message: `Successfully ${action === 'add' ? 'assigned' : 'unassigned'} ${clientIds.length} clients`,
+      specialist: {
+        id: specialist.id,
+        name: specialist.name,
+        clientIds: updatedSpecialistClients
+      }
+    });
+  } catch (error) {
+    await trx.rollback();
+    console.error('Assign clients error:', error);
+    res.status(500).json({ error: 'Failed to assign clients' });
+  }
+};
+
+// Upload profile picture
+const uploadProfilePicture = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { user } = req;
+    
+    // Check authorization
+    const userRoles = JSON.parse(user.roles);
+    const isAdmin = userRoles.includes('admin') || userRoles.includes('owner');
+    
+    if (!isAdmin && user.id !== id) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    
+    if (!req.profilePictureUrl) {
+      return res.status(400).json({ error: 'Failed to upload profile picture' });
+    }
+    
+    // Get current user to delete old picture
+    const currentUser = await db('users').where({ id }).first();
+    if (!currentUser) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    // Delete old profile picture if exists
+    if (currentUser.profile_picture_url) {
+      try {
+        const oldKey = currentUser.profile_picture_url.split('/').slice(-2).join('/');
+        await fileService.deleteFile(oldKey);
+      } catch (error) {
+        console.error('Failed to delete old profile picture:', error);
+      }
+    }
+    
+    // Update user with new profile picture URL
+    await db('users')
+      .where({ id })
+      .update({
+        profile_picture_url: req.profilePictureUrl,
+        updated_at: new Date()
+      });
+    
+    res.json({
+      profilePictureUrl: req.profilePictureUrl,
+      message: 'Profile picture uploaded successfully'
+    });
+  } catch (error) {
+    console.error('Upload profile picture error:', error);
+    res.status(500).json({ error: 'Failed to upload profile picture' });
+  }
+};
+
+// Get user statistics
+const getUserStats = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { user } = req;
+    const { startDate, endDate } = req.query;
+    
+    // Check authorization
+    const userRoles = JSON.parse(user.roles);
+    const isAdmin = userRoles.includes('admin') || userRoles.includes('owner');
+    
+    if (!isAdmin && user.id !== id) {
+      // Check if specialist viewing their client
+      const clientIds = JSON.parse(user.client_ids || '[]');
+      if (!clientIds.includes(id)) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+    }
+    
+    // Get user to check their role
+    const targetUser = await db('users').where({ id }).first();
+    if (!targetUser) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const targetUserRoles = JSON.parse(targetUser.roles);
+    let stats = {};
+    
+    if (targetUserRoles.includes('client')) {
+      // Client statistics
+      const dateFilter = (query) => {
+        if (startDate) query.where('created_at', '>=', startDate);
+        if (endDate) query.where('created_at', '<=', endDate);
+        return query;
+      };
+      
+      // Workout stats
+      const workoutStats = await dateFilter(
+        db('workouts').where({ client_id: id })
+      )
+        .select(
+          db.raw('COUNT(*) as total_workouts'),
+          db.raw('COUNT(CASE WHEN completed = true THEN 1 END) as completed_workouts'),
+          db.raw('AVG(CASE WHEN completed = true THEN duration END) as avg_duration'),
+          db.raw('SUM(CASE WHEN completed = true THEN calories_burned END) as total_calories'),
+          db.raw('AVG(CASE WHEN completed = true THEN mood_feedback END) as avg_mood')
+        )
+        .first();
+      
+      // Measurement progress
+      const measurements = await db('measurements')
+        .where({ client_id: id })
+        .orderBy('date', 'asc')
+        .select('date', 'weight', 'body_fat');
+      
+      // Goal stats
+      const goalStats = await dateFilter(
+        db('goals').where({ client_id: id })
+      )
+        .select(
+          db.raw('COUNT(*) as total_goals'),
+          db.raw('COUNT(CASE WHEN completed = true THEN 1 END) as completed_goals')
+        )
+        .first();
+      
+      // Activity streaks
+      const recentWorkouts = await db('workouts')
+        .where({ client_id: id, completed: true })
+        .orderBy('completed_date', 'desc')
+        .limit(30)
+        .select('completed_date');
+      
+      const currentStreak = calculateStreak(recentWorkouts.map(w => w.completed_date));
+      
+      stats = {
+        workouts: {
+          total: parseInt(workoutStats.total_workouts),
+          completed: parseInt(workoutStats.completed_workouts),
+          completionRate: workoutStats.total_workouts > 0 
+            ? Math.round((workoutStats.completed_workouts / workoutStats.total_workouts) * 100)
+            : 0,
+          avgDuration: Math.round(workoutStats.avg_duration) || 0,
+          totalCalories: parseInt(workoutStats.total_calories) || 0,
+          avgMood: parseFloat(workoutStats.avg_mood) || 0
+        },
+        measurements: {
+          data: measurements,
+          weightChange: measurements.length >= 2 
+            ? measurements[measurements.length - 1].weight - measurements[0].weight
+            : 0,
+          bodyFatChange: measurements.length >= 2 && measurements[0].body_fat && measurements[measurements.length - 1].body_fat
+            ? measurements[measurements.length - 1].body_fat - measurements[0].body_fat
+            : 0
+        },
+        goals: {
+          total: parseInt(goalStats.total_goals),
+          completed: parseInt(goalStats.completed_goals),
+          completionRate: goalStats.total_goals > 0
+            ? Math.round((goalStats.completed_goals / goalStats.total_goals) * 100)
+            : 0
+        },
+        activity: {
+          currentStreak,
+          lastWorkout: recentWorkouts[0]?.completed_date || null
+        }
+      };
+    } else if (targetUserRoles.includes('specialist')) {
+      // Specialist statistics
+      const clientIds = JSON.parse(targetUser.client_ids || '[]');
+      
+      // Client engagement stats
+      const activeClients = await db('workouts')
+        .whereIn('client_id', clientIds)
+        .where('created_at', '>=', new Date(Date.now() - 30 * 24 * 60 * 60 * 1000))
+        .distinct('client_id')
+        .count('* as count')
+        .first();
+      
+      // Workouts assigned
+      const workoutsAssigned = await db('workouts')
+        .where({ assigned_by: id })
+        .count('* as count')
+        .first();
+      
+      // Average client progress
+      const clientProgress = await db('goals')
+        .whereIn('client_id', clientIds)
+        .select(
+          db.raw('COUNT(*) as total_goals'),
+          db.raw('COUNT(CASE WHEN completed = true THEN 1 END) as completed_goals')
+        )
+        .first();
+      
+      // Revenue stats (if billing enabled)
+      let revenueStats = null;
+      if (targetUser.billing_enabled) {
+        revenueStats = await db('invoices')
+          .where({ issued_by: id })
+          .where('status', 'paid')
+          .select(
+            db.raw('COUNT(*) as total_invoices'),
+            db.raw('SUM(total) as total_revenue'),
+            db.raw('AVG(total) as avg_invoice')
+          )
+          .first();
+      }
+      
+      stats = {
+        clients: {
+          total: clientIds.length,
+          active: parseInt(activeClients.count),
+          inactiveRate: clientIds.length > 0
+            ? Math.round(((clientIds.length - activeClients.count) / clientIds.length) * 100)
+            : 0
+        },
+        workouts: {
+          assigned: parseInt(workoutsAssigned.count)
+        },
+        clientSuccess: {
+          totalGoals: parseInt(clientProgress.total_goals),
+          completedGoals: parseInt(clientProgress.completed_goals),
+          successRate: clientProgress.total_goals > 0
+            ? Math.round((clientProgress.completed_goals / clientProgress.total_goals) * 100)
+            : 0
+        },
+        revenue: revenueStats ? {
+          totalInvoices: parseInt(revenueStats.total_invoices),
+          totalRevenue: parseFloat(revenueStats.total_revenue) || 0,
+          avgInvoice: parseFloat(revenueStats.avg_invoice) || 0
+        } : null
+      };
+    }
+    
+    res.json({
+      userId: id,
+      role: targetUserRoles[0],
+      period: {
+        start: startDate || 'all time',
+        end: endDate || 'present'
+      },
+      stats
+    });
+  } catch (error) {
+    console.error('Get user stats error:', error);
+    res.status(500).json({ error: 'Failed to fetch user statistics' });
+  }
+};
+
+// Helper function to calculate workout streak
+const calculateStreak = (dates) => {
+  if (!dates || dates.length === 0) return 0;
+  
+  let streak = 1;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  
+  // Sort dates in descending order
+  const sortedDates = dates
+    .map(d => new Date(d))
+    .sort((a, b) => b - a);
+  
+  // Check if the streak is current
+  const lastWorkout = new Date(sortedDates[0]);
+  lastWorkout.setHours(0, 0, 0, 0);
+  
+  const daysSinceLastWorkout = Math.floor((today - lastWorkout) / (1000 * 60 * 60 * 24));
+  if (daysSinceLastWorkout > 1) return 0; // Streak is broken
+  
+  // Count consecutive days
+  for (let i = 1; i < sortedDates.length; i++) {
+    const currentDate = new Date(sortedDates[i]);
+    const previousDate = new Date(sortedDates[i - 1]);
+    
+    currentDate.setHours(0, 0, 0, 0);
+    previousDate.setHours(0, 0, 0, 0);
+    
+    const dayDifference = Math.floor((previousDate - currentDate) / (1000 * 60 * 60 * 24));
+    
+    if (dayDifference === 1) {
+      streak++;
+    } else {
+      break;
+    }
+  }
+  
+  return streak;
+};
+
+// Bulk operations
+const bulkUpdateUsers = async (req, res) => {
+  const trx = await db.transaction();
+  
+  try {
+    const { user } = req;
+    const { userIds, updates } = req.body;
+    
+    // Check authorization - only admins and owners
+    const userRoles = JSON.parse(user.roles);
+    if (!userRoles.includes('admin') && !userRoles.includes('owner')) {
+      await trx.rollback();
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    
+    // Validate inputs
+    if (!Array.isArray(userIds) || userIds.length === 0) {
+      await trx.rollback();
+      return res.status(400).json({ error: 'No users selected' });
+    }
+    
+    // Prepare bulk update data
+    const allowedUpdates = {};
+    
+    // Only allow specific fields for bulk updates
+    if (updates.subscriptionPlan !== undefined) allowedUpdates.subscription_plan = updates.subscriptionPlan;
+    if (updates.billingEnabled !== undefined) allowedUpdates.billing_enabled = updates.billingEnabled;
+    if (updates.canTrainClients !== undefined) allowedUpdates.can_train_clients = updates.canTrainClients;
+    
+    if (Object.keys(allowedUpdates).length === 0) {
+      await trx.rollback();
+      return res.status(400).json({ error: 'No valid bulk updates provided' });
+    }
+    
+    allowedUpdates.updated_at = new Date();
+    
+    // Perform bulk update
+    const updatedCount = await trx('users')
+      .whereIn('id', userIds)
+      .update(allowedUpdates);
+    
+    // Log audit
+    await trx('audit_logs').insert({
+      user_id: user.id,
+      action: 'bulk_update',
+      resource: 'users',
+      resource_id: null,
+      details: `Bulk updated ${updatedCount} users`,
+      ip_address: req.ip,
+      user_agent: req.get('user-agent'),
+      metadata: JSON.stringify({ 
+        userIds,
+        updates: allowedUpdates,
+        count: updatedCount
+      })
+    });
+    
+    await trx.commit();
+    
+    res.json({
+      message: `Successfully updated ${updatedCount} users`,
+      count: updatedCount
+    });
+  } catch (error) {
+    await trx.rollback();
+    console.error('Bulk update error:', error);
+    res.status(500).json({ error: 'Failed to perform bulk update' });
+  }
+};
+
+module.exports = {
+  getUsers,
+  getUser,
+  updateUser,
+  deleteUser,
+  assignClients,
+  uploadProfilePicture,
+  getUserStats,
+  bulkUpdateUsers
+};

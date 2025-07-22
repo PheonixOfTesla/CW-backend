@@ -1,0 +1,360 @@
+const router = require('express').Router();
+const userController = require('../controllers/userController');
+const { authenticate, authorize } = require('../middleware/auth');
+const { validateRequest, validateParams, validateQuery } = require('../middleware/validation');
+const { validationSchemas, schemas } = require('../middleware/validation');
+const { uploadProfilePicture, processProfilePicture } = require('../services/fileService');
+const rateLimiter = require('../middleware/rateLimiter');
+const Joi = require('joi');
+
+// Custom validation schemas for users
+const userSchemas = {
+  assignClients: Joi.object({
+    clientIds: Joi.array().items(schemas.uuid).min(1).required(),
+    action: Joi.string().valid('add', 'remove').default('add')
+  }),
+  
+  bulkUpdate: Joi.object({
+    userIds: Joi.array().items(schemas.uuid).min(1).required(),
+    updates: Joi.object({
+      subscriptionPlan: Joi.string().valid('basic', 'professional', 'premium').optional(),
+      billingEnabled: Joi.boolean().optional(),
+      canTrainClients: Joi.boolean().optional()
+    }).min(1).required()
+  }),
+  
+  userFilters: Joi.object({
+    role: Joi.string().valid('client', 'specialist', 'admin', 'owner', 'engineer').optional(),
+    search: Joi.string().max(100).optional(),
+    status: Joi.string().valid('online', 'offline').optional(),
+    page: Joi.number().integer().min(1).default(1),
+    limit: Joi.number().integer().min(1).max(100).default(20),
+    sortBy: Joi.string().valid('created_at', 'name', 'email', 'last_seen').default('created_at'),
+    sortOrder: Joi.string().valid('asc', 'desc').default('desc')
+  }),
+  
+  userStats: Joi.object({
+    startDate: schemas.date.optional(),
+    endDate: schemas.date.optional()
+  })
+};
+
+// Apply general rate limiting
+router.use(rateLimiter.general);
+
+// Public user routes (authenticated users only)
+
+// Get all users (with filters and pagination)
+router.get(
+  '/',
+  authenticate,
+  authorize('admin', 'owner', 'specialist'),
+  validateQuery(userSchemas.userFilters),
+  userController.getUsers
+);
+
+// Get current user's profile
+router.get(
+  '/me',
+  authenticate,
+  async (req, res) => {
+    // Redirect to getUser with current user's ID
+    req.params.id = req.user.id;
+    return userController.getUser(req, res);
+  }
+);
+
+// Get specific user by ID
+router.get(
+  '/:id',
+  authenticate,
+  validateParams(schemas.idParam),
+  userController.getUser
+);
+
+// Update current user's profile
+router.put(
+  '/me',
+  authenticate,
+  validateRequest(validationSchemas.updateUser),
+  async (req, res) => {
+    // Redirect to updateUser with current user's ID
+    req.params.id = req.user.id;
+    return userController.updateUser(req, res);
+  }
+);
+
+// Update specific user (admin or self only)
+router.put(
+  '/:id',
+  authenticate,
+  validateParams(schemas.idParam),
+  validateRequest(validationSchemas.updateUser),
+  userController.updateUser
+);
+
+// Delete user (admin only)
+router.delete(
+  '/:id',
+  authenticate,
+  authorize('admin', 'owner'),
+  validateParams(schemas.idParam),
+  rateLimiter.strict,
+  userController.deleteUser
+);
+
+// Specialist-Client management
+
+// Assign clients to a specialist
+router.post(
+  '/:specialistId/clients',
+  authenticate,
+  authorize('admin', 'owner'),
+  validateParams(Joi.object({ specialistId: schemas.uuid })),
+  validateRequest(userSchemas.assignClients),
+  userController.assignClients
+);
+
+// Bulk operations (admin only)
+
+// Bulk update users
+router.put(
+  '/bulk/update',
+  authenticate,
+  authorize('admin', 'owner'),
+  validateRequest(userSchemas.bulkUpdate),
+  rateLimiter.strict,
+  userController.bulkUpdateUsers
+);
+
+// File uploads
+
+// Upload profile picture
+router.post(
+  '/:id/profile-picture',
+  authenticate,
+  validateParams(schemas.idParam),
+  rateLimiter.upload,
+  uploadProfilePicture,
+  processProfilePicture,
+  userController.uploadProfilePicture
+);
+
+// Analytics and statistics
+
+// Get user statistics
+router.get(
+  '/:id/stats',
+  authenticate,
+  validateParams(schemas.idParam),
+  validateQuery(userSchemas.userStats),
+  userController.getUserStats
+);
+
+// Advanced search (for admins)
+router.post(
+  '/search/advanced',
+  authenticate,
+  authorize('admin', 'owner'),
+  validateRequest(Joi.object({
+    filters: Joi.object({
+      roles: Joi.array().items(Joi.string()).optional(),
+      subscriptionPlans: Joi.array().items(Joi.string()).optional(),
+      dateRange: Joi.object({
+        start: schemas.date,
+        end: schemas.date
+      }).optional(),
+      hasProfilePicture: Joi.boolean().optional(),
+      isActive: Joi.boolean().optional()
+    }),
+    page: Joi.number().integer().min(1).default(1),
+    limit: Joi.number().integer().min(1).max(100).default(20)
+  })),
+  async (req, res) => {
+    // This would be implemented in the controller for advanced search
+    res.status(501).json({ error: 'Advanced search not yet implemented' });
+  }
+);
+
+// User activity logs (admin only)
+router.get(
+  '/:id/activity',
+  authenticate,
+  authorize('admin', 'owner'),
+  validateParams(schemas.idParam),
+  validateQuery(schemas.pagination),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { page = 1, limit = 20 } = req.query;
+      
+      const offset = (page - 1) * limit;
+      
+      const [logs, [{ count }]] = await Promise.all([
+        db('audit_logs')
+          .where({ user_id: id })
+          .orderBy('timestamp', 'desc')
+          .limit(limit)
+          .offset(offset),
+        db('audit_logs')
+          .where({ user_id: id })
+          .count('* as count')
+      ]);
+      
+      res.json({
+        logs,
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(limit),
+          total: parseInt(count),
+          pages: Math.ceil(count / limit)
+        }
+      });
+    } catch (error) {
+      console.error('Get user activity error:', error);
+      res.status(500).json({ error: 'Failed to fetch activity logs' });
+    }
+  }
+);
+
+// Export user data (GDPR compliance)
+router.get(
+  '/:id/export',
+  authenticate,
+  validateParams(schemas.idParam),
+  rateLimiter.strict,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { user } = req;
+      
+      // Users can only export their own data unless admin
+      const userRoles = JSON.parse(user.roles);
+      if (user.id !== id && !userRoles.includes('admin') && !userRoles.includes('owner')) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+      
+      // Collect all user data
+      const userData = await db('users').where({ id }).first();
+      const measurements = await db('measurements').where({ client_id: id });
+      const workouts = await db('workouts').where({ client_id: id });
+      const nutrition = await db('nutrition').where({ client_id: id }).first();
+      const goals = await db('goals').where({ client_id: id });
+      const messages = await db('messages')
+        .where({ sender_id: id })
+        .orWhere({ recipient_id: id });
+      
+      const exportData = {
+        userData: { ...userData, password: undefined },
+        measurements,
+        workouts: workouts.map(w => ({ ...w, exercises: JSON.parse(w.exercises || '[]') })),
+        nutrition: nutrition ? {
+          ...nutrition,
+          protein: JSON.parse(nutrition.protein),
+          carbs: JSON.parse(nutrition.carbs),
+          fat: JSON.parse(nutrition.fat),
+          calories: JSON.parse(nutrition.calories),
+          fiber: JSON.parse(nutrition.fiber),
+          water: JSON.parse(nutrition.water),
+          mealPlan: JSON.parse(nutrition.meal_plan),
+          restrictions: JSON.parse(nutrition.restrictions || '[]'),
+          supplements: JSON.parse(nutrition.supplements || '[]')
+        } : null,
+        goals: goals.map(g => ({ ...g, milestones: JSON.parse(g.milestones || '[]') })),
+        messages,
+        exportDate: new Date(),
+        exportedBy: user.id
+      };
+      
+      // Log export
+      await db('audit_logs').insert({
+        user_id: user.id,
+        action: 'export_user_data',
+        resource: 'user',
+        resource_id: id,
+        details: 'Exported user data for GDPR compliance',
+        ip_address: req.ip,
+        user_agent: req.get('user-agent')
+      });
+      
+      res.json(exportData);
+    } catch (error) {
+      console.error('Export user data error:', error);
+      res.status(500).json({ error: 'Failed to export user data' });
+    }
+  }
+);
+
+// Account suspension/activation (admin only)
+router.post(
+  '/:id/suspend',
+  authenticate,
+  authorize('admin', 'owner'),
+  validateParams(schemas.idParam),
+  validateRequest(Joi.object({
+    reason: Joi.string().required(),
+    duration: Joi.number().integer().min(1).optional() // days
+  })),
+  rateLimiter.strict,
+  async (req, res) => {
+    // This would be implemented to suspend user accounts
+    res.status(501).json({ error: 'Account suspension not yet implemented' });
+  }
+);
+
+// Get user's connected devices/sessions
+router.get(
+  '/:id/sessions',
+  authenticate,
+  validateParams(schemas.idParam),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { user } = req;
+      
+      // Users can only view their own sessions unless admin
+      const userRoles = JSON.parse(user.roles);
+      if (user.id !== id && !userRoles.includes('admin')) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+      
+      // Get recent login activity
+      const sessions = await db('audit_logs')
+        .where({
+          user_id: id,
+          action: 'login'
+        })
+        .orderBy('timestamp', 'desc')
+        .limit(20);
+      
+      const formattedSessions = sessions.map(session => ({
+        id: session.id,
+        ipAddress: session.ip_address,
+        userAgent: session.user_agent,
+        timestamp: session.timestamp,
+        location: 'Unknown', // Would need IP geolocation service
+        device: parseUserAgent(session.user_agent)
+      }));
+      
+      res.json({ sessions: formattedSessions });
+    } catch (error) {
+      console.error('Get user sessions error:', error);
+      res.status(500).json({ error: 'Failed to fetch sessions' });
+    }
+  }
+);
+
+// Helper function
+const parseUserAgent = (userAgent) => {
+  if (!userAgent) return 'Unknown Device';
+  
+  if (userAgent.includes('Mobile')) return 'Mobile Device';
+  if (userAgent.includes('Tablet')) return 'Tablet';
+  if (userAgent.includes('Windows')) return 'Windows PC';
+  if (userAgent.includes('Mac')) return 'Mac';
+  if (userAgent.includes('Linux')) return 'Linux';
+  
+  return 'Unknown Device';
+};
+
+module.exports = router;

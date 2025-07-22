@@ -1,0 +1,941 @@
+const { db } = require('../config/database');
+const emailService = require('../services/emailService');
+const smsService = require('../services/smsService');
+
+// Get training sessions
+const getTrainingSessions = async (req, res) => {
+  try {
+    const { user } = req;
+    const { 
+      trainerId,
+      clientId,
+      status,
+      startDate,
+      endDate,
+      page = 1,
+      limit = 20,
+      sortBy = 'date',
+      sortOrder = 'asc'
+    } = req.query;
+    
+    let query = db('training_sessions')
+      .select(
+        'training_sessions.*',
+        'trainers.name as trainer_name',
+        'clients.name as client_name',
+        'trainers.profile_picture_url as trainer_picture',
+        'clients.profile_picture_url as client_picture'
+      )
+      .leftJoin('users as trainers', 'training_sessions.trainer_id', 'trainers.id')
+      .leftJoin('users as clients', 'training_sessions.client_id', 'clients.id');
+    
+    // Apply filters based on user role
+    const userRoles = JSON.parse(user.roles);
+    
+    if (userRoles.includes('client')) {
+      // Clients see only their sessions
+      query = query.where('training_sessions.client_id', user.id);
+    } else if (userRoles.includes('specialist')) {
+      if (trainerId) {
+        query = query.where('training_sessions.trainer_id', trainerId);
+      } else {
+        // Specialists see their own sessions
+        query = query.where('training_sessions.trainer_id', user.id);
+      }
+      
+      if (clientId) {
+        // Verify specialist has access to this client
+        const clientIds = JSON.parse(user.client_ids || '[]');
+        if (!userRoles.includes('admin') && !clientIds.includes(clientId)) {
+          return res.status(403).json({ error: 'Access denied' });
+        }
+        query = query.where('training_sessions.client_id', clientId);
+      }
+    } else if (userRoles.includes('admin') || userRoles.includes('owner')) {
+      // Admins can filter by trainer or client
+      if (trainerId) query = query.where('training_sessions.trainer_id', trainerId);
+      if (clientId) query = query.where('training_sessions.client_id', clientId);
+    }
+    
+    // Apply additional filters
+    if (status) {
+      query = query.where('training_sessions.status', status);
+    }
+    
+    if (startDate) {
+      query = query.where('training_sessions.date', '>=', startDate);
+    }
+    
+    if (endDate) {
+      query = query.where('training_sessions.date', '<=', endDate);
+    }
+    
+    // Get total count
+    const [{ count }] = await query.clone().count('* as count');
+    
+    // Apply pagination
+    const offset = (page - 1) * limit;
+    const sessions = await query
+      .orderBy(sortBy, sortOrder)
+      .limit(limit)
+      .offset(offset);
+    
+    res.json({
+      sessions,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: parseInt(count),
+        pages: Math.ceil(count / limit)
+      }
+    });
+  } catch (error) {
+    console.error('Get training sessions error:', error);
+    res.status(500).json({ error: 'Failed to fetch training sessions' });
+  }
+};
+
+// Get single training session
+const getTrainingSession = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { user } = req;
+    
+    const session = await db('training_sessions')
+      .select(
+        'training_sessions.*',
+        'trainers.name as trainer_name',
+        'trainers.email as trainer_email',
+        'trainers.phone as trainer_phone',
+        'clients.name as client_name',
+        'clients.email as client_email',
+        'clients.phone as client_phone'
+      )
+      .leftJoin('users as trainers', 'training_sessions.trainer_id', 'trainers.id')
+      .leftJoin('users as clients', 'training_sessions.client_id', 'clients.id')
+      .where('training_sessions.id', id)
+      .first();
+    
+    if (!session) {
+      return res.status(404).json({ error: 'Training session not found' });
+    }
+    
+    // Check authorization
+    const userRoles = JSON.parse(user.roles);
+    const isParticipant = session.trainer_id === user.id || session.client_id === user.id;
+    const isAdmin = userRoles.includes('admin') || userRoles.includes('owner');
+    
+    if (!isParticipant && !isAdmin) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    
+    res.json(session);
+  } catch (error) {
+    console.error('Get training session error:', error);
+    res.status(500).json({ error: 'Failed to fetch training session' });
+  }
+};
+
+// Create training session
+const createTrainingSession = async (req, res) => {
+  const trx = await db.transaction();
+  
+  try {
+    const { user } = req;
+    const {
+      clientId,
+      date,
+      time,
+      duration = 60,
+      type,
+      location,
+      notes,
+      zoomLink,
+      isRecurring = false,
+      recurrencePattern
+    } = req.body;
+    
+    // Validate user can create sessions
+    const userRoles = JSON.parse(user.roles);
+    if (!userRoles.includes('specialist') && !userRoles.includes('admin') && !userRoles.includes('owner')) {
+      await trx.rollback();
+      return res.status(403).json({ error: 'Only trainers can create training sessions' });
+    }
+    
+    // Verify access to client
+    if (userRoles.includes('specialist') && !userRoles.includes('admin')) {
+      const clientIds = JSON.parse(user.client_ids || '[]');
+      if (!clientIds.includes(clientId)) {
+        await trx.rollback();
+        return res.status(403).json({ error: 'You do not have access to this client' });
+      }
+    }
+    
+    // Validate date is in the future
+    const sessionDate = new Date(date);
+    if (sessionDate < new Date().setHours(0, 0, 0, 0)) {
+      await trx.rollback();
+      return res.status(400).json({ error: 'Cannot create sessions in the past' });
+    }
+    
+    // Check for conflicts
+    const conflicts = await trx('training_sessions')
+      .where({ date, trainer_id: user.id })
+      .where('status', '!=', 'cancelled')
+      .where(function() {
+        this.where('time', '=', time)
+          .orWhere(function() {
+            // Check for overlapping time slots
+            const startTime = new Date(`2000-01-01 ${time}`);
+            const endTime = new Date(startTime.getTime() + duration * 60000);
+            const endTimeStr = endTime.toTimeString().slice(0, 5);
+            
+            this.where('time', '<', endTimeStr)
+              .andWhere(db.raw("time::time + (duration || ' minutes')::interval > ?::time", [time]));
+          });
+      });
+    
+    if (conflicts.length > 0) {
+      await trx.rollback();
+      return res.status(409).json({ error: 'Time slot conflict with existing session' });
+    }
+    
+    const sessionsToCreate = [];
+    
+    if (isRecurring && recurrencePattern) {
+      // Create recurring sessions
+      const { frequency, count, endDate: recurrenceEndDate } = recurrencePattern;
+      const sessionDates = generateRecurringDates(date, frequency, count, recurrenceEndDate);
+      
+      for (const sessionDate of sessionDates) {
+        sessionsToCreate.push({
+          id: `SESSION-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+          trainer_id: user.id,
+          client_id: clientId,
+          date: sessionDate,
+          time,
+          duration,
+          type,
+          status: 'scheduled',
+          location,
+          notes,
+          zoom_link: zoomLink
+        });
+      }
+    } else {
+      // Single session
+      sessionsToCreate.push({
+        id: `SESSION-${Date.now()}`,
+        trainer_id: user.id,
+        client_id: clientId,
+        date,
+        time,
+        duration,
+        type,
+        status: 'scheduled',
+        location,
+        notes,
+        zoom_link: zoomLink
+      });
+    }
+    
+    // Insert sessions
+    const createdSessions = await trx('training_sessions')
+      .insert(sessionsToCreate)
+      .returning('*');
+    
+    // Get client info for notifications
+    const client = await trx('users')
+      .where({ id: clientId })
+      .first();
+    
+    // Send notifications for the first session
+    const firstSession = createdSessions[0];
+    
+    // Email notification
+    await emailService.sendCustomEmail(
+      client.email,
+      'New Training Session Scheduled',
+      `
+      <h2>Training Session Scheduled</h2>
+      <p>Hi ${client.name},</p>
+      <p>${user.name} has scheduled a ${type} session with you:</p>
+      <ul>
+        <li><strong>Date:</strong> ${new Date(firstSession.date).toLocaleDateString()}</li>
+        <li><strong>Time:</strong> ${firstSession.time}</li>
+        <li><strong>Duration:</strong> ${duration} minutes</li>
+        <li><strong>Location:</strong> ${location || 'TBD'}</li>
+        ${zoomLink ? `<li><strong>Zoom Link:</strong> <a href="${zoomLink}">Join Session</a></li>` : ''}
+      </ul>
+      ${notes ? `<p><strong>Notes:</strong> ${notes}</p>` : ''}
+      ${isRecurring ? `<p>This is a recurring session (${createdSessions.length} sessions total).</p>` : ''}
+      `,
+      { template_id: 'session_scheduled' }
+    );
+    
+    // SMS notification if phone available
+    if (client.phone) {
+      await smsService.sendCustomSMS(
+        client.phone,
+        `Training session scheduled with ${user.name} on ${new Date(firstSession.date).toLocaleDateString()} at ${firstSession.time}. Check your email for details.`
+      );
+    }
+    
+    // Real-time notification
+    const io = req.app.get('io');
+    io.to(clientId).emit('session-scheduled', {
+      session: firstSession,
+      trainer: { id: user.id, name: user.name },
+      isRecurring,
+      totalSessions: createdSessions.length
+    });
+    
+    // Log audit
+    await trx('audit_logs').insert({
+      user_id: user.id,
+      action: 'create_training_session',
+      resource: 'training_session',
+      resource_id: firstSession.id,
+      details: `Scheduled ${createdSessions.length} training session(s) with ${client.name}`,
+      ip_address: req.ip,
+      user_agent: req.get('user-agent'),
+      metadata: JSON.stringify({ 
+        sessionCount: createdSessions.length,
+        isRecurring,
+        type
+      })
+    });
+    
+    await trx.commit();
+    
+    res.status(201).json({
+      sessions: createdSessions,
+      message: `${createdSessions.length} session(s) scheduled successfully`
+    });
+  } catch (error) {
+    await trx.rollback();
+    console.error('Create training session error:', error);
+    res.status(500).json({ error: 'Failed to create training session' });
+  }
+};
+
+// Update training session
+const updateTrainingSession = async (req, res) => {
+  const trx = await db.transaction();
+  
+  try {
+    const { id } = req.params;
+    const { user } = req;
+    const updateData = req.body;
+    
+    // Get existing session
+    const session = await trx('training_sessions')
+      .where({ id })
+      .first();
+    
+    if (!session) {
+      await trx.rollback();
+      return res.status(404).json({ error: 'Training session not found' });
+    }
+    
+    // Check authorization
+    const userRoles = JSON.parse(user.roles);
+    const isTrainer = session.trainer_id === user.id;
+    const isAdmin = userRoles.includes('admin') || userRoles.includes('owner');
+    
+    if (!isTrainer && !isAdmin) {
+      await trx.rollback();
+      return res.status(403).json({ error: 'Only the trainer or admin can update sessions' });
+    }
+    
+    // Don't allow updating past sessions unless admin
+    const sessionDateTime = new Date(`${session.date} ${session.time}`);
+    if (sessionDateTime < new Date() && !isAdmin) {
+      await trx.rollback();
+      return res.status(400).json({ error: 'Cannot update past sessions' });
+    }
+    
+    // Check for time conflicts if date/time is being changed
+    if (updateData.date || updateData.time) {
+      const newDate = updateData.date || session.date;
+      const newTime = updateData.time || session.time;
+      const newDuration = updateData.duration || session.duration;
+      
+      const conflicts = await trx('training_sessions')
+        .where({ date: newDate, trainer_id: session.trainer_id })
+        .where('id', '!=', id)
+        .where('status', '!=', 'cancelled')
+        .where(function() {
+          this.where('time', '=', newTime)
+            .orWhere(function() {
+              const startTime = new Date(`2000-01-01 ${newTime}`);
+              const endTime = new Date(startTime.getTime() + newDuration * 60000);
+              const endTimeStr = endTime.toTimeString().slice(0, 5);
+              
+              this.where('time', '<', endTimeStr)
+                .andWhere(db.raw("time::time + (duration || ' minutes')::interval > ?::time", [newTime]));
+            });
+        });
+      
+      if (conflicts.length > 0) {
+        await trx.rollback();
+        return res.status(409).json({ error: 'Time slot conflict with existing session' });
+      }
+    }
+    
+    // Prepare updates
+    const updates = {};
+    if (updateData.date !== undefined) updates.date = updateData.date;
+    if (updateData.time !== undefined) updates.time = updateData.time;
+    if (updateData.duration !== undefined) updates.duration = updateData.duration;
+    if (updateData.type !== undefined) updates.type = updateData.type;
+    if (updateData.location !== undefined) updates.location = updateData.location;
+    if (updateData.notes !== undefined) updates.notes = updateData.notes;
+    if (updateData.zoomLink !== undefined) updates.zoom_link = updateData.zoomLink;
+    if (updateData.status !== undefined) updates.status = updateData.status;
+    
+    updates.updated_at = new Date();
+    
+    // Update session
+    const [updated] = await trx('training_sessions')
+      .where({ id })
+      .update(updates)
+      .returning('*');
+    
+    // Get participant info
+    const [trainer, client] = await Promise.all([
+      trx('users').where({ id: session.trainer_id }).first(),
+      trx('users').where({ id: session.client_id }).first()
+    ]);
+    
+    // Send notifications about the update
+    const notificationRecipient = isTrainer ? client : trainer;
+    
+    await emailService.sendCustomEmail(
+      notificationRecipient.email,
+      'Training Session Updated',
+      `
+      <h2>Training Session Updated</h2>
+      <p>Hi ${notificationRecipient.name},</p>
+      <p>Your training session has been updated:</p>
+      <ul>
+        <li><strong>Date:</strong> ${new Date(updated.date).toLocaleDateString()}</li>
+        <li><strong>Time:</strong> ${updated.time}</li>
+        <li><strong>Duration:</strong> ${updated.duration} minutes</li>
+        <li><strong>Type:</strong> ${updated.type}</li>
+        <li><strong>Location:</strong> ${updated.location || 'TBD'}</li>
+        ${updated.zoom_link ? `<li><strong>Zoom Link:</strong> <a href="${updated.zoom_link}">Join Session</a></li>` : ''}
+      </ul>
+      ${updated.notes ? `<p><strong>Notes:</strong> ${updated.notes}</p>` : ''}
+      `,
+      { template_id: 'session_updated' }
+    );
+    
+    // Real-time notification
+    const io = req.app.get('io');
+    io.to(notificationRecipient.id).emit('session-updated', {
+      session: updated,
+      updatedBy: { id: user.id, name: user.name }
+    });
+    
+    await trx.commit();
+    
+    res.json({
+      session: updated,
+      message: 'Training session updated successfully'
+    });
+  } catch (error) {
+    await trx.rollback();
+    console.error('Update training session error:', error);
+    res.status(500).json({ error: 'Failed to update training session' });
+  }
+};
+
+// Cancel training session
+const cancelTrainingSession = async (req, res) => {
+  const trx = await db.transaction();
+  
+  try {
+    const { id } = req.params;
+    const { user } = req;
+    const { reason, notifyParticipants = true } = req.body;
+    
+    // Get session
+    const session = await trx('training_sessions')
+      .where({ id })
+      .first();
+    
+    if (!session) {
+      await trx.rollback();
+      return res.status(404).json({ error: 'Training session not found' });
+    }
+    
+    // Check authorization
+    const userRoles = JSON.parse(user.roles);
+    const isParticipant = session.trainer_id === user.id || session.client_id === user.id;
+    const isAdmin = userRoles.includes('admin') || userRoles.includes('owner');
+    
+    if (!isParticipant && !isAdmin) {
+      await trx.rollback();
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    
+    if (session.status === 'cancelled') {
+      await trx.rollback();
+      return res.status(400).json({ error: 'Session is already cancelled' });
+    }
+    
+    // Update status
+    await trx('training_sessions')
+      .where({ id })
+      .update({
+        status: 'cancelled',
+        updated_at: new Date()
+      });
+    
+    // Log cancellation
+    await trx('session_cancellations').insert({
+      session_id: id,
+      cancelled_by: user.id,
+      reason,
+      cancelled_at: new Date()
+    });
+    
+    // Send notifications if requested
+    if (notifyParticipants) {
+      const [trainer, client] = await Promise.all([
+        trx('users').where({ id: session.trainer_id }).first(),
+        trx('users').where({ id: session.client_id }).first()
+      ]);
+      
+      const cancelledBy = user.id === trainer.id ? trainer : client;
+      const notifyUser = user.id === trainer.id ? client : trainer;
+      
+      // Email notification
+      await emailService.sendCustomEmail(
+        notifyUser.email,
+        'Training Session Cancelled',
+        `
+        <h2>Training Session Cancelled</h2>
+        <p>Hi ${notifyUser.name},</p>
+        <p>${cancelledBy.name} has cancelled the training session scheduled for:</p>
+        <ul>
+          <li><strong>Date:</strong> ${new Date(session.date).toLocaleDateString()}</li>
+          <li><strong>Time:</strong> ${session.time}</li>
+        </ul>
+        ${reason ? `<p><strong>Reason:</strong> ${reason}</p>` : ''}
+        <p>Please contact ${cancelledBy.name} to reschedule.</p>
+        `,
+        { template_id: 'session_cancelled' }
+      );
+      
+      // SMS notification
+      if (notifyUser.phone) {
+        await smsService.sendAppointmentCancellation(
+          notifyUser.phone,
+          {
+            date: session.date,
+            time: session.time,
+            type: session.type,
+            trainerName: trainer.name
+          }
+        );
+      }
+      
+      // Real-time notification
+      const io = req.app.get('io');
+      io.to(notifyUser.id).emit('session-cancelled', {
+        session,
+        cancelledBy: { id: cancelledBy.id, name: cancelledBy.name },
+        reason
+      });
+    }
+    
+    await trx.commit();
+    
+    res.json({
+      message: 'Training session cancelled successfully'
+    });
+  } catch (error) {
+    await trx.rollback();
+    console.error('Cancel training session error:', error);
+    res.status(500).json({ error: 'Failed to cancel training session' });
+  }
+};
+
+// Complete training session
+const completeTrainingSession = async (req, res) => {
+  const trx = await db.transaction();
+  
+  try {
+    const { id } = req.params;
+    const { user } = req;
+    const { 
+      feedback,
+      rating,
+      notes,
+      nextSessionRecommended
+    } = req.body;
+    
+    // Get session
+    const session = await trx('training_sessions')
+      .where({ id })
+      .first();
+    
+    if (!session) {
+      await trx.rollback();
+      return res.status(404).json({ error: 'Training session not found' });
+    }
+    
+    // Check authorization - only trainer can complete
+    if (session.trainer_id !== user.id) {
+      await trx.rollback();
+      return res.status(403).json({ error: 'Only the trainer can complete the session' });
+    }
+    
+    if (session.status === 'completed') {
+      await trx.rollback();
+      return res.status(400).json({ error: 'Session is already completed' });
+    }
+    
+    // Update session
+    const [updated] = await trx('training_sessions')
+      .where({ id })
+      .update({
+        status: 'completed',
+        completed_at: new Date(),
+        feedback,
+        notes: notes || session.notes,
+        updated_at: new Date()
+      })
+      .returning('*');
+    
+    // Record session completion details
+    await trx('session_completions').insert({
+      session_id: id,
+      trainer_rating: rating,
+      trainer_feedback: feedback,
+      next_session_recommended: nextSessionRecommended,
+      completed_at: new Date()
+    });
+    
+    // Get client info
+    const client = await trx('users')
+      .where({ id: session.client_id })
+      .first();
+    
+    // Send completion notification to client
+    const io = req.app.get('io');
+    io.to(client.id).emit('session-completed', {
+      session: updated,
+      trainer: { id: user.id, name: user.name },
+      rating,
+      nextSessionRecommended
+    });
+    
+    // Log audit
+    await trx('audit_logs').insert({
+      user_id: user.id,
+      action: 'complete_training_session',
+      resource: 'training_session',
+      resource_id: id,
+      details: `Completed training session with ${client.name}`,
+      ip_address: req.ip,
+      user_agent: req.get('user-agent'),
+      metadata: JSON.stringify({ rating, nextSessionRecommended })
+    });
+    
+    await trx.commit();
+    
+    res.json({
+      session: updated,
+      message: 'Training session completed successfully'
+    });
+  } catch (error) {
+    await trx.rollback();
+    console.error('Complete training session error:', error);
+    res.status(500).json({ error: 'Failed to complete training session' });
+  }
+};
+
+// Get availability
+const getAvailability = async (req, res) => {
+  try {
+    const { trainerId, date, duration = 60 } = req.query;
+    const { user } = req;
+    
+    // Determine which trainer's availability to check
+    const targetTrainerId = trainerId || user.id;
+    
+    // Verify the user can view this availability
+    const userRoles = JSON.parse(user.roles);
+    if (!userRoles.includes('client') && targetTrainerId !== user.id && !userRoles.includes('admin')) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    
+    // Get trainer's working hours (simplified - in production, this would come from a schedule table)
+    const workingHours = {
+      start: '09:00',
+      end: '18:00',
+      breakStart: '12:00',
+      breakEnd: '13:00'
+    };
+    
+    // Get existing sessions for the date
+    const existingSessions = await db('training_sessions')
+      .where({ 
+        trainer_id: targetTrainerId,
+        date,
+        status: ['scheduled', 'confirmed']
+      })
+      .whereIn('status', ['scheduled', 'confirmed'])
+      .orderBy('time', 'asc');
+    
+    // Calculate available slots
+    const availableSlots = calculateAvailableSlots(
+      workingHours,
+      existingSessions,
+      duration
+    );
+    
+    res.json({
+      trainerId: targetTrainerId,
+      date,
+      duration,
+      workingHours,
+      existingSessions: existingSessions.map(s => ({
+        time: s.time,
+        duration: s.duration,
+        type: s.type
+      })),
+      availableSlots
+    });
+  } catch (error) {
+    console.error('Get availability error:', error);
+    res.status(500).json({ error: 'Failed to fetch availability' });
+  }
+};
+
+// Get training statistics
+const getTrainingStats = async (req, res) => {
+  try {
+    const { user } = req;
+    const { startDate, endDate, clientId, trainerId } = req.query;
+    
+    let query = db('training_sessions');
+    
+    // Apply filters based on role
+    const userRoles = JSON.parse(user.roles);
+    
+    if (userRoles.includes('client')) {
+      query = query.where('client_id', user.id);
+    } else if (userRoles.includes('specialist')) {
+      if (trainerId && trainerId !== user.id && !userRoles.includes('admin')) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+      query = query.where('trainer_id', trainerId || user.id);
+      
+      if (clientId) {
+        const clientIds = JSON.parse(user.client_ids || '[]');
+        if (!clientIds.includes(clientId) && !userRoles.includes('admin')) {
+          return res.status(403).json({ error: 'Access denied' });
+        }
+        query = query.where('client_id', clientId);
+      }
+    } else {
+      // Admin - apply any filters
+      if (trainerId) query = query.where('trainer_id', trainerId);
+      if (clientId) query = query.where('client_id', clientId);
+    }
+    
+    if (startDate) {
+      query = query.where('date', '>=', startDate);
+    }
+    
+    if (endDate) {
+      query = query.where('date', '<=', endDate);
+    }
+    
+    // Get statistics
+    const [stats] = await query
+      .select(
+        db.raw('COUNT(*) as total_sessions'),
+        db.raw('COUNT(CASE WHEN status = ? THEN 1 END) as completed_sessions', ['completed']),
+        db.raw('COUNT(CASE WHEN status = ? THEN 1 END) as cancelled_sessions', ['cancelled']),
+        db.raw('COUNT(CASE WHEN status = ? THEN 1 END) as scheduled_sessions', ['scheduled']),
+        db.raw('SUM(CASE WHEN status = ? THEN duration END) as total_minutes', ['completed']),
+        db.raw('AVG(CASE WHEN status = ? THEN duration END) as avg_duration', ['completed'])
+      )
+      .first();
+    
+    // Get session types breakdown
+    const typeBreakdown = await query.clone()
+      .select('type')
+      .count('* as count')
+      .groupBy('type');
+    
+    // Get cancellation reasons if any
+    let cancellationReasons = [];
+    if (stats.cancelled_sessions > 0) {
+      cancellationReasons = await db('session_cancellations')
+        .select('reason')
+        .count('* as count')
+        .whereIn('session_id', function() {
+          this.select('id').from('training_sessions').where(query._single);
+        })
+        .groupBy('reason')
+        .orderBy('count', 'desc')
+        .limit(5);
+    }
+    
+    // Calculate metrics
+    const completionRate = stats.total_sessions > 0
+      ? Math.round((stats.completed_sessions / stats.total_sessions) * 100)
+      : 0;
+    
+    const cancellationRate = stats.total_sessions > 0
+      ? Math.round((stats.cancelled_sessions / stats.total_sessions) * 100)
+      : 0;
+    
+    res.json({
+      overview: {
+        totalSessions: parseInt(stats.total_sessions),
+        completedSessions: parseInt(stats.completed_sessions),
+        cancelledSessions: parseInt(stats.cancelled_sessions),
+        scheduledSessions: parseInt(stats.scheduled_sessions),
+        totalMinutes: parseInt(stats.total_minutes) || 0,
+        totalHours: Math.round((stats.total_minutes || 0) / 60),
+        avgDuration: Math.round(stats.avg_duration) || 0,
+        completionRate,
+        cancellationRate
+      },
+      breakdown: {
+        byType: typeBreakdown.reduce((acc, item) => {
+          acc[item.type] = parseInt(item.count);
+          return acc;
+        }, {}),
+        cancellationReasons: cancellationReasons.map(r => ({
+          reason: r.reason || 'Not specified',
+          count: parseInt(r.count)
+        }))
+      },
+      period: {
+        start: startDate || 'all time',
+        end: endDate || 'present'
+      }
+    });
+  } catch (error) {
+    console.error('Get training stats error:', error);
+    res.status(500).json({ error: 'Failed to fetch training statistics' });
+  }
+};
+
+// Helper functions
+
+const generateRecurringDates = (startDate, frequency, count, endDate) => {
+  const dates = [];
+  const current = new Date(startDate);
+  const end = endDate ? new Date(endDate) : null;
+  
+  for (let i = 0; i < (count || 52); i++) { // Max 52 occurrences
+    if (end && current > end) break;
+    
+    dates.push(new Date(current));
+    
+    switch (frequency) {
+      case 'daily':
+        current.setDate(current.getDate() + 1);
+        break;
+      case 'weekly':
+        current.setDate(current.getDate() + 7);
+        break;
+      case 'biweekly':
+        current.setDate(current.getDate() + 14);
+        break;
+      case 'monthly':
+        current.setMonth(current.getMonth() + 1);
+        break;
+      default:
+        break;
+    }
+  }
+  
+  return dates;
+};
+
+const calculateAvailableSlots = (workingHours, existingSessions, duration) => {
+  const slots = [];
+  const slotDuration = duration;
+  const slotInterval = 30; // 30-minute intervals
+  
+  // Parse working hours
+  const workStart = new Date(`2000-01-01 ${workingHours.start}`);
+  const workEnd = new Date(`2000-01-01 ${workingHours.end}`);
+  const breakStart = new Date(`2000-01-01 ${workingHours.breakStart}`);
+  const breakEnd = new Date(`2000-01-01 ${workingHours.breakEnd}`);
+  
+  // Generate all possible slots
+  let current = new Date(workStart);
+  
+  while (current < workEnd) {
+    const slotEnd = new Date(current.getTime() + slotDuration * 60000);
+    
+    // Skip if slot overlaps with break
+    const overlapsBreak = current < breakEnd && slotEnd > breakStart;
+    
+    // Skip if slot overlaps with existing session
+    const overlapsSession = existingSessions.some(session => {
+      const sessionStart = new Date(`2000-01-01 ${session.time}`);
+      const sessionEnd = new Date(sessionStart.getTime() + session.duration * 60000);
+      return current < sessionEnd && slotEnd > sessionStart;
+    });
+    
+    // Add slot if available
+    if (!overlapsBreak && !overlapsSession && slotEnd <= workEnd) {
+      slots.push({
+        time: current.toTimeString().slice(0, 5),
+        available: true
+      });
+    }
+    
+    // Move to next interval
+    current.setMinutes(current.getMinutes() + slotInterval);
+  }
+  
+  return slots;
+};
+
+// Create session tables if they don't exist
+const createSessionTables = `
+  CREATE TABLE IF NOT EXISTS session_completions (
+    id SERIAL PRIMARY KEY,
+    session_id VARCHAR(255) REFERENCES training_sessions(id) ON DELETE CASCADE,
+    trainer_rating INTEGER,
+    trainer_feedback TEXT,
+    client_rating INTEGER,
+    client_feedback TEXT,
+    next_session_recommended BOOLEAN,
+    completed_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+  
+  CREATE TABLE IF NOT EXISTS session_cancellations (
+    id SERIAL PRIMARY KEY,
+    session_id VARCHAR(255) REFERENCES training_sessions(id) ON DELETE CASCADE,
+    cancelled_by UUID REFERENCES users(id),
+    reason TEXT,
+    cancelled_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`;
+
+module.exports = {
+  getTrainingSessions,
+  getTrainingSession,
+  createTrainingSession,
+  updateTrainingSession,
+  cancelTrainingSession,
+  completeTrainingSession,
+  getAvailability,
+  getTrainingStats
+};
